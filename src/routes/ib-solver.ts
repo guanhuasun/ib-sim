@@ -365,13 +365,15 @@ export function computeVelMagnitude(u: np.Array): np.Array {
   return np.sqrt(ux.ref.mul(ux).add(uy.ref.mul(uy)));
 }
 
-// CPU-side bilinear upsample from Float32Array [N*N] -> [M*M]
+// CPU-side bilinear upsample from Float32Array [N*N] -> [M*M].
+// Source is node-centered: src[j] represents the field at UV j/N.
+// Destination is also node-centered: dst[mi] represents the field at UV mi/M.
 export function upsampleCPU(src: Float32Array, N: number, M: number): Float32Array {
   const dst = new Float32Array(M * M);
   for (let mi = 0; mi < M; mi++) {
     for (let mj = 0; mj < M; mj++) {
-      const fi = (mi / M) * N - 0.5;
-      const fj = (mj / M) * N - 0.5;
+      const fi = (mi / M) * N;
+      const fj = (mj / M) * N;
       const i0 = Math.floor(fi);
       const j0 = Math.floor(fj);
       const i1 = i0 + 1;

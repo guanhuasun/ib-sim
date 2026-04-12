@@ -192,8 +192,11 @@
         let wx = in.uv.x;
         let wy = in.uv.y;
 
-        let px = clamp(u32(wx * f32(M)), 0u, M - 1u);
-        let py = clamp(u32(wy * f32(M)), 0u, M - 1u);
+        // Node-centered sampling: pixel px corresponds to source index px at
+        // UV px/M, so round-to-nearest (not floor) for correct alignment with
+        // boundary points drawn at their true physical coordinates.
+        let px = min(u32(round(wx * f32(M))), M - 1u);
+        let py = min(u32(round(wy * f32(M))), M - 1u);
         let idx = px * M + py;
         let v = field[idx] / u.fieldScale;
 
