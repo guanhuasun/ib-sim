@@ -704,6 +704,8 @@
   </section>
 </main>
 
+<footer class="copyright">&copy; 2026 Guanhua Sun</footer>
+
 <style>
   .ib-sim {
     max-width: 960px;
@@ -1064,5 +1066,15 @@
     font-family: var(--font-mono);
     font-size: 12px;
     color: var(--color-warn);
+  }
+
+  .copyright {
+    position: fixed;
+    right: 16px;
+    bottom: 12px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--color-text-caption);
+    pointer-events: none;
   }
 </style>
