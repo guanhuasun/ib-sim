@@ -28,14 +28,31 @@
   let vizMode = $state<"vorticity" | "velocity">("vorticity");
   let colormap = $state(0); // index into WGSL colormap array
   let smooth = $state(true); // bilinear upsample toggle
+  let invertBg = $state(true); // false: black-centered; true: white-centered
   const colormapNames = [
     "Cyan-Magenta",
     "Teal-Orange",
-    "Blue-Yellow",
-    "Green-Purple",
     "Red-Blue",
-    "Twilight",
+    "Purple-Orange",
+    "Brown-Teal",
+    "Coolwarm",
   ];
+  // Endpoint colors for the UI swatch previews.
+  // Order: [negative (left), positive (right)] — matches WGSL convention.
+  const colormapEnds: [string, string][] = [
+    ["rgb(0,230,230)", "rgb(255,51,204)"],
+    ["rgb(0,179,166)", "rgb(255,140,26)"],
+    ["rgb(26,102,255)", "rgb(255,51,26)"],
+    ["rgb(84,39,136)", "rgb(230,97,1)"],
+    ["rgb(140,81,10)", "rgb(1,102,94)"],
+    ["rgb(59,76,192)", "rgb(180,4,38)"],
+  ];
+  let colormapGradients = $derived.by(() => {
+    const center = invertBg ? "#fff" : "#000";
+    return colormapEnds.map(
+      ([neg, pos]) => `linear-gradient(to right, ${neg}, ${center}, ${pos})`,
+    );
+  });
   let N = $state(64);
   let M = $derived(N * 2); // upsample resolution
   const PAUSE_INTERVAL = 1000;
@@ -58,6 +75,8 @@
 
   // Derived
   let simTime = $derived(frameCount * paramDt);
+  let vizLabel = $derived(vizMode === "vorticity" ? "vort" : "|vel|");
+  let cmapLabel = $derived(colormapNames[colormap].toLowerCase());
 
   // Mouse state
   let mouseDown = $state(false);
@@ -89,6 +108,7 @@
         lineWidth: f32,
         vizMode: u32,
         cmap: u32,
+        invertBg: u32,
       };
 
       @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -110,53 +130,50 @@
         return out;
       }
 
-      // Diverging colormaps: v in [-1,1], black at center
-      fn cmapCyanMagenta(v: f32) -> vec3f {
+      // Diverging colormaps: v in [-1,1], center color is c (either black or white).
+      fn cmapCyanMagenta(v: f32, c: vec3f) -> vec3f {
         let t = clamp(v, -1.0, 1.0);
-        if (t > 0.0) { return mix(vec3f(0,0,0), vec3f(1.0, 0.2, 0.8), t); }
-        else { return mix(vec3f(0,0,0), vec3f(0.0, 0.9, 0.9), -t); }
+        if (t > 0.0) { return mix(c, vec3f(1.0, 0.2, 0.8), t); }
+        else { return mix(c, vec3f(0.0, 0.9, 0.9), -t); }
       }
-      fn cmapTealOrange(v: f32) -> vec3f {
+      fn cmapTealOrange(v: f32, c: vec3f) -> vec3f {
         let t = clamp(v, -1.0, 1.0);
-        if (t > 0.0) { return mix(vec3f(0,0,0), vec3f(1.0, 0.55, 0.1), t); }
-        else { return mix(vec3f(0,0,0), vec3f(0.0, 0.7, 0.65), -t); }
+        if (t > 0.0) { return mix(c, vec3f(1.0, 0.55, 0.1), t); }
+        else { return mix(c, vec3f(0.0, 0.7, 0.65), -t); }
       }
-      fn cmapBlueYellow(v: f32) -> vec3f {
+      fn cmapRedBlue(v: f32, c: vec3f) -> vec3f {
         let t = clamp(v, -1.0, 1.0);
-        if (t > 0.0) { return mix(vec3f(0,0,0), vec3f(1.0, 0.95, 0.2), t); }
-        else { return mix(vec3f(0,0,0), vec3f(0.15, 0.3, 1.0), -t); }
+        if (t > 0.0) { return mix(c, vec3f(1.0, 0.2, 0.1), t); }
+        else { return mix(c, vec3f(0.1, 0.4, 1.0), -t); }
       }
-      fn cmapGreenPurple(v: f32) -> vec3f {
+      // ColorBrewer PuOr (purple <-> orange)
+      fn cmapPurpleOrange(v: f32, c: vec3f) -> vec3f {
         let t = clamp(v, -1.0, 1.0);
-        if (t > 0.0) { return mix(vec3f(0,0,0), vec3f(0.7, 0.2, 1.0), t); }
-        else { return mix(vec3f(0,0,0), vec3f(0.1, 0.85, 0.3), -t); }
+        if (t > 0.0) { return mix(c, vec3f(0.902, 0.380, 0.004), t); }
+        else { return mix(c, vec3f(0.329, 0.153, 0.533), -t); }
       }
-      fn cmapRedBlue(v: f32) -> vec3f {
+      // ColorBrewer BrBG (brown <-> blue-green)
+      fn cmapBrownTeal(v: f32, c: vec3f) -> vec3f {
         let t = clamp(v, -1.0, 1.0);
-        if (t > 0.0) { return mix(vec3f(0,0,0), vec3f(1.0, 0.2, 0.1), t); }
-        else { return mix(vec3f(0,0,0), vec3f(0.1, 0.4, 1.0), -t); }
+        if (t > 0.0) { return mix(c, vec3f(0.004, 0.400, 0.369), t); }
+        else { return mix(c, vec3f(0.549, 0.318, 0.039), -t); }
       }
-      fn cmapTwilight(v: f32) -> vec3f {
+      // Matplotlib coolwarm endpoints
+      fn cmapCoolwarm(v: f32, c: vec3f) -> vec3f {
         let t = clamp(v, -1.0, 1.0);
-        if (t > 0.0) {
-          if (t < 0.5) { return mix(vec3f(0,0,0), vec3f(0.8, 0.15, 0.3), t * 2.0); }
-          else { return mix(vec3f(0.8, 0.15, 0.3), vec3f(1.0, 0.7, 0.5), (t - 0.5) * 2.0); }
-        } else {
-          let s = -t;
-          if (s < 0.5) { return mix(vec3f(0,0,0), vec3f(0.2, 0.15, 0.6), s * 2.0); }
-          else { return mix(vec3f(0.2, 0.15, 0.6), vec3f(0.5, 0.6, 1.0), (s - 0.5) * 2.0); }
-        }
+        if (t > 0.0) { return mix(c, vec3f(0.706, 0.016, 0.149), t); }
+        else { return mix(c, vec3f(0.231, 0.298, 0.753), -t); }
       }
 
-      fn divergingColor(v: f32, cm: u32) -> vec3f {
+      fn divergingColor(v: f32, cm: u32, c: vec3f) -> vec3f {
         switch cm {
-          case 0u: { return cmapCyanMagenta(v); }
-          case 1u: { return cmapTealOrange(v); }
-          case 2u: { return cmapBlueYellow(v); }
-          case 3u: { return cmapGreenPurple(v); }
-          case 4u: { return cmapRedBlue(v); }
-          case 5u: { return cmapTwilight(v); }
-          default: { return cmapCyanMagenta(v); }
+          case 0u: { return cmapCyanMagenta(v, c); }
+          case 1u: { return cmapTealOrange(v, c); }
+          case 2u: { return cmapRedBlue(v, c); }
+          case 3u: { return cmapPurpleOrange(v, c); }
+          case 4u: { return cmapBrownTeal(v, c); }
+          case 5u: { return cmapCoolwarm(v, c); }
+          default: { return cmapCyanMagenta(v, c); }
         }
       }
 
@@ -200,8 +217,12 @@
         let idx = px * M + py;
         let v = field[idx] / u.fieldScale;
 
+        let centerColor = select(vec3f(0.0), vec3f(1.0), u.invertBg == 1u);
+        let segColor    = select(vec3f(0.9), vec3f(0.12), u.invertBg == 1u);
+        let ptColor     = select(vec3f(1.0), vec3f(0.0),  u.invertBg == 1u);
+
         // Both modes use selected colormap (magnitude uses positive branch)
-        var color = divergingColor(v, u.cmap);
+        var color = divergingColor(v, u.cmap, centerColor);
 
         let nb = u.nb;
         let worldPt = vec2f(wx, wy);
@@ -214,7 +235,7 @@
           let d = periodicSegDist(worldPt, a, b);
           if (d < u.lineWidth) {
             let alpha = smoothstep(u.lineWidth, u.lineWidth * 0.3, d);
-            color = mix(color, vec3f(0.9, 0.9, 0.9), alpha);
+            color = mix(color, segColor, alpha);
           }
         }
 
@@ -224,7 +245,7 @@
           let dist = periodicPointDist(worldPt, bpt);
           if (dist < u.pointRadius) {
             let alpha = smoothstep(u.pointRadius, u.pointRadius * 0.3, dist);
-            color = mix(color, vec3f(1.0, 1.0, 1.0), alpha);
+            color = mix(color, ptColor, alpha);
           }
         }
 
@@ -263,7 +284,7 @@
     });
 
     uniformBuffer = gpuDevice.createBuffer({
-      size: 32,
+      size: 48,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
@@ -281,14 +302,16 @@
   function renderFrame(fieldData: Float32Array, boundBuffer: GPUBuffer, texRes: number = M) {
     const pointRadius = 0.6 / (64 * 2);
     const lineWidth = 0.4 / (64 * 2);
-    const uniformData = new Float32Array([
-      texRes, texRes,
-      vizMode === "vorticity" ? 3.0 : 1.0,
-      0, pointRadius, lineWidth, 0, 0,
-    ]);
+    const uniformData = new Float32Array(12); // 48 bytes
+    uniformData[0] = texRes;
+    uniformData[1] = texRes;
+    uniformData[2] = vizMode === "vorticity" ? 3.0 : 1.0;
+    uniformData[4] = pointRadius;
+    uniformData[5] = lineWidth;
     new Uint32Array(uniformData.buffer, 12, 1)[0] = params.Nb;
     new Uint32Array(uniformData.buffer, 24, 1)[0] = vizMode === "vorticity" ? 0 : 1;
     new Uint32Array(uniformData.buffer, 28, 1)[0] = colormap;
+    new Uint32Array(uniformData.buffer, 32, 1)[0] = invertBg ? 1 : 0;
     gpuDevice.queue.writeBuffer(uniformBuffer, 0, uniformData);
     gpuDevice.queue.writeBuffer(fieldBuffer, 0, fieldData as unknown as ArrayBuffer);
 
@@ -504,42 +527,62 @@
 </script>
 
 <main class="ib-sim">
+  <nav class="breadcrumb">
+    <a href="https://guanhuasun.github.io/">&larr; guanhuasun.github.io</a>
+  </nav>
+
   {#if errorMsg}
     <pre class="error-msg">{errorMsg}</pre>
   {/if}
 
-  <div class="header">
-    <h1>2D Immersed Boundary Method</h1>
-    <p>
+  <header class="page-header">
+    <h1>
+      <a
+        href="https://math.nyu.edu/~peskin/ib_lecture_notes/index.html"
+        class="title-link"
+        target="_blank"
+        rel="noopener noreferrer">2D Immersed Boundary Method</a
+      >
+    </h1>
+    <p class="lede">
       Elastic membrane coupled to incompressible fluid via regularized delta
       functions. Click and drag to apply force.
     </p>
-    <p>
-      Using <a href="https://github.com/ekzhang/jax-js">jax-js</a> on WebGPU. N={N}, FFT-based IMEX solver. &Delta;t={paramDt.toFixed(4)}
+    <p class="tech-line">
+      Using <a href="https://github.com/ekzhang/jax-js">jax-js</a> on WebGPU
+      &middot; N={N} &middot; FFT-based IMEX solver &middot; &Delta;t={paramDt.toFixed(4)}
     </p>
-  </div>
+  </header>
 
-  <div class="sim-area">
+  <hr />
+
+  <section class="sim-area">
     <div class="spacer"></div>
-    <div class="canvas-wrap">
-      <canvas
-        bind:this={canvas}
-        onmousemove={onMouseMove}
-        onmousedown={onMouseDown}
-        onmouseup={onMouseUp}
-        onmouseleave={onMouseUp}
-        ontouchmove={onTouchMove}
-        ontouchstart={onTouchStart}
-        ontouchend={onMouseUp}
-        ontouchcancel={onMouseUp}
-      ></canvas>
-      <div class="hud">
-        <div class="hud-time">t = {simTime.toFixed(2)} s</div>
-        <div class="hud-detail">step {frameCount} &middot; {fps} FPS</div>
+
+    <div class="canvas-block">
+      <div class="canvas-caption">
+        N={N} &middot; &Delta;t={paramDt.toFixed(4)} &middot; {vizLabel} &middot; {cmapLabel}
+      </div>
+      <div class="canvas-matte">
+        <canvas
+          bind:this={canvas}
+          onmousemove={onMouseMove}
+          onmousedown={onMouseDown}
+          onmouseup={onMouseUp}
+          onmouseleave={onMouseUp}
+          ontouchmove={onTouchMove}
+          ontouchstart={onTouchStart}
+          ontouchend={onMouseUp}
+          ontouchcancel={onMouseUp}
+        ></canvas>
+        <div class="hud hud-pill">
+          <div class="hud-time">t = {simTime.toFixed(2)} s</div>
+          <div class="hud-detail">step {frameCount} &middot; {fps} FPS</div>
+        </div>
       </div>
     </div>
 
-    <div class="param-panel">
+    <aside class="param-panel">
       <div class="param-group">
         <div class="param-label">K &mdash; Stiffness</div>
         <div class="param-desc">Elastic spring constant of the membrane [N/m]</div>
@@ -597,236 +640,429 @@
           <span class="param-val">{paramDt.toFixed(3)}</span>
         </div>
       </div>
+
+      <div class="param-group">
+        <div class="param-label">Colormap</div>
+        <div class="param-desc">Diverging palette for field visualization</div>
+        <div class="swatch-row" role="radiogroup" aria-label="Colormap">
+          {#each colormapNames as name, i}
+            <button
+              type="button"
+              class="swatch"
+              class:selected={colormap === i}
+              style:background={colormapGradients[i]}
+              role="radio"
+              aria-checked={colormap === i}
+              aria-label={name}
+              title={name}
+              onclick={() => (colormap = i)}
+            ></button>
+          {/each}
+        </div>
+      </div>
+    </aside>
+  </section>
+
+  <section class="toolbar">
+    <div class="toolbar-left">
+      {#if autoPaused}
+        <span class="auto-pause-msg">Paused at step {frameCount}.</span>
+      {/if}
     </div>
-  </div>
 
-  <div class="toolbar">
-    {#if autoPaused}
-      <span class="auto-pause-msg">Paused at step {frameCount}.</span>
-    {/if}
-    <label class="toolbar-label">
-      Grid:
-      <select value={paramN} onchange={(e) => changeN(Number(e.currentTarget.value))}>
-        <option value={64}>64×64</option>
-        <option value={128}>128×128</option>
-      </select>
-    </label>
-    <label class="toolbar-label">
-      View:
-      <select bind:value={vizMode}>
-        <option value="vorticity">Vorticity</option>
-        <option value="velocity">|Velocity|</option>
-      </select>
-    </label>
-    <label class="toolbar-label">
-      Color:
-      <select bind:value={colormap}>
-        {#each colormapNames as name, i}
-          <option value={i}>{name}</option>
-        {/each}
-      </select>
-    </label>
-    <label class="toolbar-label">
-      <input type="checkbox" bind:checked={smooth} />
-      Smooth
-    </label>
-    <button onclick={togglePause}>
-      {paused ? (autoPaused ? "Continue" : "Play") : "Pause"}
-    </button>
-    <button onclick={resetSim}>Reset</button>
-  </div>
+    <div class="toolbar-right">
+      <label class="toolbar-field">
+        <span class="toolbar-label">Grid</span>
+        <div class="select-wrap">
+          <select value={paramN} onchange={(e) => changeN(Number(e.currentTarget.value))}>
+            <option value={64}>64 &times; 64</option>
+            <option value={128}>128 &times; 128</option>
+          </select>
+        </div>
+      </label>
+
+      <label class="toolbar-field">
+        <span class="toolbar-label">View</span>
+        <div class="select-wrap">
+          <select bind:value={vizMode}>
+            <option value="vorticity">Vorticity</option>
+            <option value="velocity">|Velocity|</option>
+          </select>
+        </div>
+      </label>
+
+      <label class="toolbar-field inline">
+        <input type="checkbox" bind:checked={smooth} />
+        <span class="toolbar-label">Smooth</span>
+      </label>
+
+      <button class="btn" onclick={resetSim}>Reset</button>
+      <button class="btn btn-primary" onclick={togglePause}>
+        {paused ? (autoPaused ? "Continue" : "Play") : "Pause"}
+      </button>
+    </div>
+  </section>
 </main>
-
-<svelte:head>
-  <style>
-    body {
-      background: #000;
-    }
-  </style>
-</svelte:head>
 
 <style>
   .ib-sim {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    width: 100%;
-    height: 100vh;
-    overflow: hidden;
-    color: #eee;
-    font-family: system-ui, sans-serif;
-    padding: 8px;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 28px 24px 48px;
+    color: var(--color-text);
+    font-family: var(--font-serif);
+  }
+
+  .breadcrumb {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    margin-bottom: 20px;
+  }
+  .breadcrumb a {
+    color: var(--color-text-meta);
+  }
+  .breadcrumb a:hover {
+    color: var(--color-text);
   }
 
   .error-msg {
-    color: red;
-    background: #300;
-    padding: 12px;
-    max-width: 600px;
-    overflow: auto;
-    font-size: 0.8rem;
-    border-radius: 4px;
+    background: var(--color-danger-bg);
+    color: var(--color-warn);
+    border: 1px solid var(--color-warn);
+    padding: 12px 14px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.4;
+    margin-bottom: 16px;
+    white-space: pre-wrap;
+    word-break: break-word;
   }
 
-  .header {
-    text-align: center;
-    padding-bottom: 6px;
-    color: #bbb;
+  .page-header {
+    margin-bottom: 16px;
   }
-
-  .header h1 {
-    font-size: 1.15rem;
+  .page-header h1 {
+    font-family: var(--font-serif);
+    font-size: 22px;
     font-weight: 600;
-    color: #ddd;
+    line-height: 1.25;
+    letter-spacing: -0.01em;
+    margin: 0 0 6px 0;
+    color: var(--color-text);
   }
-
-  .header p {
-    font-size: 0.8rem;
-    color: #777;
-    margin-top: 2px;
+  .title-link {
+    color: inherit;
+    text-decoration: none;
+    transition: color 0.15s ease;
   }
-
-  .header a {
-    color: rgba(253, 224, 71, 0.8);
+  .title-link:hover {
+    color: var(--color-link);
     text-decoration: underline;
+    text-underline-offset: 3px;
+  }
+  .lede {
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 1.55;
+    color: var(--color-text-meta);
+    margin: 0 0 6px 0;
+    max-width: 680px;
+  }
+  .tech-line {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--color-text-caption);
+    margin: 0;
   }
 
-  /* --- Main simulation area: spacer + canvas + right panel --- */
+  hr {
+    margin: 16px 0 24px;
+  }
+
+  /* --- Simulation area: spacer + canvas + right panel --- */
 
   .sim-area {
     display: flex;
-    gap: 16px;
+    gap: 24px;
     align-items: flex-start;
   }
-
   .spacer {
-    width: 180px;
-    flex-shrink: 0;
+    flex: 1 1 auto;
+    min-width: 0;
   }
-
-  .canvas-wrap {
+  .canvas-block {
+    flex: 0 0 auto;
+  }
+  .canvas-caption {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--color-text-caption);
+    margin-bottom: 6px;
+    letter-spacing: 0.01em;
+  }
+  .canvas-matte {
     position: relative;
-    flex-shrink: 0;
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    padding: 12px;
+    display: inline-block;
+    line-height: 0;
   }
-
   canvas {
     width: 512px;
     height: 512px;
     cursor: crosshair;
-    border: 1px solid #222;
     display: block;
+    border: 1px solid var(--color-border);
   }
 
   .hud {
     position: absolute;
-    top: 8px;
-    left: 10px;
-    text-align: left;
-    pointer-events: none;
+    left: 20px;
+    bottom: 20px;
+    line-height: 1.2;
   }
-
   .hud-time {
-    font-size: 1.1rem;
-    font-weight: 600;
-    color: rgba(255, 255, 255, 0.85);
-    text-shadow: 0 1px 4px rgba(0, 0, 0, 0.9);
+    font-family: var(--font-mono);
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--color-text);
   }
-
   .hud-detail {
-    font-size: 0.8rem;
-    color: rgba(255, 255, 255, 0.5);
-    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--color-text-meta);
+    margin-top: 1px;
   }
 
-  /* --- Parameter panel (right side) --- */
+  /* --- Parameter panel --- */
 
   .param-panel {
     display: flex;
     flex-direction: column;
-    gap: 16px;
-    width: 180px;
-    padding-top: 4px;
+    gap: 20px;
+    width: 220px;
+    flex: 0 0 220px;
+    padding-top: 18px; /* align with canvas matte below caption */
   }
-
   .param-group {
     display: flex;
     flex-direction: column;
-    gap: 2px;
+    gap: 4px;
   }
-
   .param-label {
-    font-size: 0.85rem;
-    font-weight: 600;
-    color: #ccc;
+    font-family: var(--font-sans);
+    font-size: 13px;
+    font-weight: 500;
+    letter-spacing: 0.01em;
+    color: var(--color-text);
   }
-
   .param-desc {
-    font-size: 0.7rem;
-    color: #666;
-    line-height: 1.3;
+    font-family: var(--font-serif);
+    font-size: 12px;
+    color: var(--color-text-meta);
+    line-height: 1.4;
   }
-
   .param-row {
     display: flex;
     align-items: center;
-    gap: 6px;
-    margin-top: 2px;
+    gap: 10px;
+    margin-top: 4px;
   }
-
   .param-row input[type="range"] {
-    width: 120px;
-    accent-color: #e8c44a;
+    flex: 1 1 auto;
+    width: auto;
+    accent-color: var(--color-border-strong);
+    cursor: pointer;
   }
-
   .param-val {
-    font-size: 0.8rem;
-    color: #aaa;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--color-text);
     font-variant-numeric: tabular-nums;
-    min-width: 3.5em;
+    min-width: 3.2em;
     text-align: right;
   }
 
-  /* --- Centered toolbar --- */
+  /* Range slider: flat track + soft-cornered handle */
+  .param-row input[type="range"] {
+    -webkit-appearance: none;
+    appearance: none;
+    height: 2px;
+    background: var(--color-border);
+    border: 0;
+    padding: 0;
+  }
+  .param-row input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 14px;
+    height: 14px;
+    background: var(--color-border-strong);
+    border-radius: 2px;
+    border: 0;
+    cursor: pointer;
+    transition: background 0.15s ease;
+  }
+  .param-row input[type="range"]::-webkit-slider-thumb:hover {
+    background: var(--color-link);
+  }
+  .param-row input[type="range"]::-moz-range-thumb {
+    width: 14px;
+    height: 14px;
+    background: var(--color-border-strong);
+    border-radius: 2px;
+    border: 0;
+    cursor: pointer;
+    transition: background 0.15s ease;
+  }
+  .param-row input[type="range"]::-moz-range-thumb:hover {
+    background: var(--color-link);
+  }
+  .param-row input[type="range"]::-moz-range-track {
+    height: 2px;
+    background: var(--color-border);
+    border: 0;
+  }
+
+  /* Colormap swatches */
+  .swatch-row {
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 4px;
+    margin-top: 6px;
+  }
+  .swatch {
+    height: 18px;
+    width: 100%;
+    border: 1px solid var(--color-border);
+    padding: 0;
+    background-clip: padding-box;
+    cursor: pointer;
+    transition: border-color 0.15s ease, transform 0.15s ease;
+  }
+  .swatch:hover {
+    border-color: var(--color-border-strong);
+  }
+  .swatch.selected {
+    border: 2px solid var(--color-border-strong);
+    height: 18px;
+  }
+
+  /* --- Toolbar --- */
 
   .toolbar {
     display: flex;
-    gap: 12px;
     align-items: center;
-    justify-content: center;
-    margin-top: 8px;
-    font-size: 0.85rem;
-    color: #ccc;
+    justify-content: space-between;
+    gap: 16px;
+    margin-top: 28px;
+    padding-top: 16px;
+    border-top: 1px solid var(--color-border);
+    flex-wrap: wrap;
   }
-
-  .toolbar-label {
+  .toolbar-left {
     display: flex;
     align-items: center;
+    min-height: 32px;
+  }
+  .toolbar-right {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  .toolbar-field {
+    display: flex;
+    flex-direction: column;
     gap: 4px;
   }
+  .toolbar-field.inline {
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+    padding-top: 18px; /* align with selects */
+  }
+  .toolbar-label {
+    font-family: var(--font-sans);
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--color-text-meta);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  .toolbar-right .btn {
+    align-self: flex-end;
+  }
 
+  .select-wrap {
+    position: relative;
+  }
+  .select-wrap::after {
+    content: "";
+    position: absolute;
+    right: 10px;
+    top: 50%;
+    width: 8px;
+    height: 8px;
+    border-right: 1px solid var(--color-text-meta);
+    border-bottom: 1px solid var(--color-text-meta);
+    transform: translateY(-75%) rotate(45deg);
+    pointer-events: none;
+  }
   .toolbar select {
-    background: #222;
-    border: 1px solid #444;
-    color: #eee;
-    border-radius: 4px;
-    padding: 2px 4px;
-  }
-
-  .toolbar button {
-    padding: 4px 14px;
-    background: #222;
-    border: 1px solid #444;
-    color: #eee;
-    border-radius: 4px;
+    -webkit-appearance: none;
+    -moz-appearance: none;
+    appearance: none;
+    background: var(--color-bg);
+    border: 1px solid var(--color-border);
+    color: var(--color-text);
+    font-family: var(--font-sans);
+    font-size: 13px;
+    font-weight: 500;
+    padding: 6px 28px 6px 10px;
+    border-radius: 0;
     cursor: pointer;
+    transition: border-color 0.15s ease;
+    min-width: 110px;
+  }
+  .toolbar select:hover {
+    border-color: var(--color-border-strong);
   }
 
-  .toolbar button:hover {
-    background: #333;
+  /* Checkbox */
+  .toolbar-field.inline input[type="checkbox"] {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 14px;
+    height: 14px;
+    background: var(--color-bg);
+    border: 1px solid var(--color-border-strong);
+    border-radius: 2px;
+    cursor: pointer;
+    position: relative;
+    margin: 0;
+    transition: background 0.15s ease;
+  }
+  .toolbar-field.inline input[type="checkbox"]:checked {
+    background: var(--color-border-strong);
+  }
+  .toolbar-field.inline input[type="checkbox"]:checked::after {
+    content: "";
+    position: absolute;
+    left: 3px;
+    top: 0px;
+    width: 5px;
+    height: 9px;
+    border-right: 2px solid var(--color-bg);
+    border-bottom: 2px solid var(--color-bg);
+    transform: rotate(45deg);
   }
 
   .auto-pause-msg {
-    font-size: 0.8rem;
-    color: #e8c44a;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--color-warn);
   }
 </style>

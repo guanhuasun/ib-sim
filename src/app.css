@@ -1,8 +1,110 @@
 @import "tailwindcss";
 
+@theme {
+  --color-bg: #ffffff;
+  --color-surface: #f4f4f4;
+  --color-border: #e0e0e0;
+  --color-border-strong: #161616;
+  --color-text: #161616;
+  --color-text-meta: #525252;
+  --color-text-caption: #a8a8a8;
+  --color-link: #0f62fe;
+  --color-link-hover: #0043ce;
+  --color-focus: #0f62fe;
+  --color-warn: #da1e28;
+  --color-danger-bg: #fff1f1;
+
+  --font-sans:
+    "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+    Roboto, sans-serif;
+  --font-serif:
+    "IBM Plex Serif", ui-serif, Georgia, "Times New Roman", serif;
+  --font-mono:
+    "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+
 @layer base {
+  html {
+    background: var(--color-bg);
+  }
+  body {
+    background: var(--color-bg);
+    color: var(--color-text);
+    font-family: var(--font-serif);
+    font-size: 16px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  a {
+    color: var(--color-link);
+    text-decoration: none;
+    transition: color 0.15s ease;
+  }
+  a:hover {
+    color: var(--color-link-hover);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+  hr {
+    border: 0;
+    border-top: 1px solid var(--color-border);
+    margin: 0;
+  }
   button:not(:disabled),
   [role="button"]:not(:disabled) {
     cursor: pointer;
+  }
+  :focus-visible {
+    outline: 2px solid var(--color-focus);
+    outline-offset: 1px;
+  }
+}
+
+@layer components {
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 8px 16px;
+    background: var(--color-bg);
+    color: var(--color-text);
+    border: 1px solid var(--color-border-strong);
+    border-radius: 0;
+    font-family: var(--font-sans);
+    font-size: 13px;
+    font-weight: 500;
+    line-height: 1;
+    transition:
+      background 0.15s ease,
+      color 0.15s ease,
+      border-color 0.15s ease;
+  }
+  .btn:hover {
+    background: var(--color-border-strong);
+    color: var(--color-bg);
+  }
+  .btn-primary {
+    background: var(--color-link);
+    color: var(--color-bg);
+    border-color: var(--color-link);
+  }
+  .btn-primary:hover {
+    background: var(--color-link-hover);
+    border-color: var(--color-link-hover);
+    color: var(--color-bg);
+  }
+  .card-frame {
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    padding: 12px;
+  }
+  .hud-pill {
+    background: rgba(255, 255, 255, 0.88);
+    border: 1px solid var(--color-border);
+    padding: 4px 8px;
+    font-family: var(--font-mono);
+    color: var(--color-text);
+    pointer-events: none;
   }
 }
