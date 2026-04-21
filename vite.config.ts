@@ -18,6 +18,9 @@ export default defineConfig({
     chunkSizeWarningLimit: 4000,
   },
   server: {
+    fs: {
+      allow: [path.resolve(__dirname, "jax-js")],
+    },
     headers: {
       "Cross-Origin-Opener-Policy": "same-origin",
       "Cross-Origin-Embedder-Policy": "require-corp",

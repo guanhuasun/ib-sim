@@ -350,13 +350,13 @@
     const cx = mouseX;
     const cy = 1 - mouseY; // screen coords → physical coords
 
-    const magnitude = 30.0;
-    const sigma = 0.05;
+    const magnitude = 45.0;
+    const sigma = 0.07;
     const sigma2 = sigma * sigma;
 
     // Drag direction in physical coords
-    let fx = (mouseX - lastMouseX) * 80;
-    let fy = -(mouseY - lastMouseY) * 80; // flip y for screen → physical
+    let fx = (mouseX - lastMouseX) * 110;
+    let fy = -(mouseY - lastMouseY) * 110; // flip y for screen → physical
 
     if (Math.abs(fx) < 0.01 && Math.abs(fy) < 0.01) return;
 
