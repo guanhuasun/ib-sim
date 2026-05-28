@@ -11,10 +11,9 @@
     createParams,
     initState,
     initFourierOperator,
-    timeStep,
+    createStep,
     computeVorticity,
     computeVelMagnitude,
-    upsampleCPU,
     type IBParams,
     type IBState,
     type Precomputed,
@@ -54,7 +53,6 @@
     );
   });
   let N = $state(64);
-  let M = $derived(N * 2); // upsample resolution
   const PAUSE_INTERVAL = 1000;
   let dtMin = $derived(N === 64 ? 0.002 : 0.001);
   let dtMax = $derived(N === 64 ? 0.02 : 0.01);
@@ -72,6 +70,7 @@
   let params: IBParams;
   let sim: IBState;
   let pre: Precomputed;
+  let stepFn: ReturnType<typeof createStep>;
 
   // Derived
   let simTime = $derived(frameCount * paramDt);
@@ -91,7 +90,6 @@
   let renderBindGroupLayout: GPUBindGroupLayout;
   let canvasContext: GPUCanvasContext;
   let uniformBuffer: GPUBuffer;
-  let fieldBuffer: GPUBuffer;
 
   async function initRenderer() {
     gpuDevice = getWebGPUDevice();
@@ -109,6 +107,7 @@
         vizMode: u32,
         cmap: u32,
         invertBg: u32,
+        bilinear: u32,
       };
 
       @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -205,17 +204,36 @@
       }
 
       @fragment fn fs(in: VertexOutput) -> @location(0) vec4f {
-        let M = u32(u.texSize.x);
+        let nGrid = u32(u.texSize.x);
+        let fN = u.texSize.x;
         let wx = in.uv.x;
         let wy = in.uv.y;
 
-        // Node-centered sampling: pixel px corresponds to source index px at
-        // UV px/M, so round-to-nearest (not floor) for correct alignment with
-        // boundary points drawn at their true physical coordinates.
-        let px = min(u32(round(wx * f32(M))), M - 1u);
-        let py = min(u32(round(wy * f32(M))), M - 1u);
-        let idx = px * M + py;
-        let v = field[idx] / u.fieldScale;
+        // Sample the N×N field buffer directly (node-centered: index k sits at
+        // UV k/N) with periodic wrap. Bilinear when smoothing is on, else
+        // round-to-nearest. This replaces the CPU upsample + GPU readback.
+        var raw: f32;
+        if (u.bilinear == 1u) {
+          let fx = wx * fN;
+          let fy = wy * fN;
+          let i0 = i32(floor(fx));
+          let j0 = i32(floor(fy));
+          let wi = fx - f32(i0);
+          let wj = fy - f32(j0);
+          let ni = i32(nGrid);
+          let ci0 = u32(((i0 % ni) + ni) % ni);
+          let ci1 = u32((((i0 + 1) % ni) + ni) % ni);
+          let cj0 = u32(((j0 % ni) + ni) % ni);
+          let cj1 = u32((((j0 + 1) % ni) + ni) % ni);
+          let vx0 = mix(field[ci0 * nGrid + cj0], field[ci1 * nGrid + cj0], wi);
+          let vx1 = mix(field[ci0 * nGrid + cj1], field[ci1 * nGrid + cj1], wi);
+          raw = mix(vx0, vx1, wj);
+        } else {
+          let px = min(u32(round(wx * fN)), nGrid - 1u);
+          let py = min(u32(round(wy * fN)), nGrid - 1u);
+          raw = field[px * nGrid + py];
+        }
+        let v = raw / u.fieldScale;
 
         let centerColor = select(vec3f(0.0), vec3f(1.0), u.invertBg == 1u);
         let segColor    = select(vec3f(0.9), vec3f(0.12), u.invertBg == 1u);
@@ -287,24 +305,14 @@
       size: 48,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
-
-    reallocFieldBuffer();
   }
 
-  function reallocFieldBuffer() {
-    if (fieldBuffer) fieldBuffer.destroy();
-    fieldBuffer = gpuDevice.createBuffer({
-      size: M * M * 4,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    });
-  }
-
-  function renderFrame(fieldData: Float32Array, boundBuffer: GPUBuffer, texRes: number = M) {
+  function renderFrame(fieldBuf: GPUBuffer, boundBuffer: GPUBuffer) {
     const pointRadius = 0.6 / (64 * 2);
     const lineWidth = 0.4 / (64 * 2);
     const uniformData = new Float32Array(12); // 48 bytes
-    uniformData[0] = texRes;
-    uniformData[1] = texRes;
+    uniformData[0] = params.N;
+    uniformData[1] = params.N;
     uniformData[2] = vizMode === "vorticity" ? 3.0 : 1.0;
     uniformData[4] = pointRadius;
     uniformData[5] = lineWidth;
@@ -312,14 +320,14 @@
     new Uint32Array(uniformData.buffer, 24, 1)[0] = vizMode === "vorticity" ? 0 : 1;
     new Uint32Array(uniformData.buffer, 28, 1)[0] = colormap;
     new Uint32Array(uniformData.buffer, 32, 1)[0] = invertBg ? 1 : 0;
+    new Uint32Array(uniformData.buffer, 36, 1)[0] = smooth ? 1 : 0;
     gpuDevice.queue.writeBuffer(uniformBuffer, 0, uniformData);
-    gpuDevice.queue.writeBuffer(fieldBuffer, 0, fieldData as unknown as ArrayBuffer);
 
     const bindGroup = gpuDevice.createBindGroup({
       layout: renderBindGroupLayout,
       entries: [
         { binding: 0, resource: { buffer: uniformBuffer } },
-        { binding: 1, resource: { buffer: fieldBuffer } },
+        { binding: 1, resource: { buffer: fieldBuf } },
         { binding: 2, resource: { buffer: boundBuffer } },
       ],
     });
@@ -386,7 +394,15 @@
     while (running) {
       if (!paused) {
         applyMouseForce();
-        sim = timeStep(sim, pre, params);
+        try {
+          const [u2, X2] = stepFn(sim.u, sim.X, pre.a.ref, params);
+          sim = { u: u2, X: X2 };
+        } catch (e) {
+          console.error(e);
+          errorMsg = String(e);
+          running = false;
+          break;
+        }
         frameCount++;
         frames++;
 
@@ -397,19 +413,23 @@
         }
       }
 
-      // Compute visualization field, read to CPU, upsample
+      // Compute the visualization field on the GPU and bind its buffer directly
+      // — no CPU readback. The fragment shader does periodic bilinear upsampling.
       let viz: np.Array;
       if (vizMode === "vorticity") {
         viz = computeVorticity(sim.u.ref, params);
       } else {
         viz = computeVelMagnitude(sim.u.ref);
       }
-      const rawData = (await viz.data()) as Float32Array;
-      const fieldData = smooth ? upsampleCPU(rawData, N, M) : rawData;
-      const texRes = smooth ? M : N;
-
+      // Keep viz alive across the render. gpuBufferSync() disposes the array
+      // it's called on, and at refcount 0 jax-js calls GPUBuffer.destroy() —
+      // which would invalidate the buffer before renderFrame binds it. Bind via
+      // a temp .ref so viz retains the buffer through submit, then dispose it
+      // (destroy() is deferred by WebGPU until the submitted pass completes).
+      const fieldBuf = viz.ref.gpuBufferSync();
       const boundBuf = await sim.X.ref.gpuBuffer();
-      renderFrame(fieldData, boundBuf, texRes);
+      renderFrame(fieldBuf, boundBuf);
+      viz.dispose();
 
       // FPS counter
       const now = performance.now();
@@ -445,7 +465,6 @@
   function changeN(newN: number) {
     N = newN;
     paramDt = dtDefault;
-    reallocFieldBuffer();
     resetSim();
   }
 
@@ -462,6 +481,7 @@
     params.dt = paramDt;
     sim = initState(params);
     pre = initFourierOperator(params);
+    stepFn = createStep();
 
     await initRenderer();
     simulate();

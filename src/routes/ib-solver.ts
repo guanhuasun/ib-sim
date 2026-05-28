@@ -1,7 +1,7 @@
 // 2D Immersed Boundary Method solver using jax-js
 // Port of ib_matlab_2D
 
-import { numpy as np, DType } from "@jax-js/jax";
+import { numpy as np, DType, jit } from "@jax-js/jax";
 
 // --- Types ---
 
@@ -316,12 +316,15 @@ export function computeForce(X: np.Array, p: IBParams): np.Array {
 
 // --- Time step ---
 
-export function timeStep(
-  state: IBState,
-  pre: Precomputed,
+// Pure step kernel. Consumes u, X, a; returns [uNew, XNew]. Written so it can
+// be traced by jit() — all constants (kp/km indices, delta offsets, fft twiddle
+// inputs) are created inside and become baked jaxpr consts.
+function stepImpl(
+  u: np.Array,
+  X: np.Array,
+  a: np.Array,
   p: IBParams,
-): IBState {
-  const { u, X } = state;
+): [np.Array, np.Array] {
   const { dt } = p;
 
   // 1. Interpolate velocity to boundary, predict midpoint
@@ -333,13 +336,40 @@ export function timeStep(
   const ff = spread(F, XX.ref, p);
 
   // 3. Solve fluid
-  const [uNew, uHalf] = fluidSolve(u, ff, pre.a.ref, p);
+  const [uNew, uHalf] = fluidSolve(u, ff, a, p);
 
   // 4. Update boundary using half-step velocity
   const U1 = interp(uHalf, XX, p);
   const XNew = X.add(U1.mul(dt));
 
-  return { u: uNew, X: XNew };
+  return [uNew, XNew];
+}
+
+// Eager step (kept for reference / non-jit fallback).
+export function timeStep(
+  state: IBState,
+  pre: Precomputed,
+  p: IBParams,
+): IBState {
+  const [u, X] = stepImpl(state.u, state.X, pre.a.ref, p);
+  return { u, X };
+}
+
+// JIT-compiled step. `p` is a static arg, so the trace is cached per distinct
+// (params values, input shapes); changing dt/K/mu re-traces once and is cached.
+// The velocity, boundary, and Fourier operator arrays are dynamic inputs.
+export function createStep(): (
+  u: np.Array,
+  X: np.Array,
+  a: np.Array,
+  p: IBParams,
+) => [np.Array, np.Array] {
+  return jit(stepImpl, { staticArgnums: [3] }) as unknown as (
+    u: np.Array,
+    X: np.Array,
+    a: np.Array,
+    p: IBParams,
+  ) => [np.Array, np.Array];
 }
 
 // --- Vorticity ---
@@ -363,34 +393,4 @@ export function computeVelMagnitude(u: np.Array): np.Array {
   const ux = u.ref.slice([], [], 0);
   const uy = u.slice([], [], 1);
   return np.sqrt(ux.ref.mul(ux).add(uy.ref.mul(uy)));
-}
-
-// CPU-side bilinear upsample from Float32Array [N*N] -> [M*M].
-// Source is node-centered: src[j] represents the field at UV j/N.
-// Destination is also node-centered: dst[mi] represents the field at UV mi/M.
-export function upsampleCPU(src: Float32Array, N: number, M: number): Float32Array {
-  const dst = new Float32Array(M * M);
-  for (let mi = 0; mi < M; mi++) {
-    for (let mj = 0; mj < M; mj++) {
-      const fi = (mi / M) * N;
-      const fj = (mj / M) * N;
-      const i0 = Math.floor(fi);
-      const j0 = Math.floor(fj);
-      const i1 = i0 + 1;
-      const j1 = j0 + 1;
-      const wi = fi - i0;
-      const wj = fj - j0;
-      // Periodic wrapping
-      const ci0 = ((i0 % N) + N) % N;
-      const ci1 = ((i1 % N) + N) % N;
-      const cj0 = ((j0 % N) + N) % N;
-      const cj1 = ((j1 % N) + N) % N;
-      dst[mi * M + mj] =
-        (1 - wi) * (1 - wj) * src[ci0 * N + cj0] +
-        wi * (1 - wj) * src[ci1 * N + cj0] +
-        (1 - wi) * wj * src[ci0 * N + cj1] +
-        wi * wj * src[ci1 * N + cj1];
-    }
-  }
-  return dst;
 }
