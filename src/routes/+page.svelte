@@ -18,6 +18,7 @@
     type IBState,
     type Precomputed,
   } from "./ib-solver";
+  import { WebGpuIbSolver } from "./webgpu-ib-solver";
 
   // --- Parameters ---
   let paramK = $state(1.0);
@@ -66,16 +67,21 @@
   let paused = $state(false);
   let autoPaused = $state(false); // true when auto-paused at interval
   let errorMsg = $state("");
+  let solverMode = $state<"optimized" | "reference">("reference");
+  let perfMode = false;
+  let preferredSolver: "optimized" | "reference" = "optimized";
 
   let params: IBParams;
   let sim: IBState;
   let pre: Precomputed;
   let stepFn: ReturnType<typeof createStep>;
+  let optimizedSolver: WebGpuIbSolver | null = null;
 
   // Derived
   let simTime = $derived(frameCount * paramDt);
   let vizLabel = $derived(vizMode === "vorticity" ? "vort" : "|vel|");
   let cmapLabel = $derived(colormapNames[colormap].toLowerCase());
+  let solverLabel = $derived(solverMode === "optimized" ? "optimized" : "reference");
 
   // Mouse state
   let mouseDown = $state(false);
@@ -352,7 +358,7 @@
 
   // --- Apply localized Gaussian force from mouse ---
   function applyMouseForce() {
-    if (!mouseDown || !sim) return;
+    if (!mouseDown || !params) return;
 
     const { N: n, h } = params;
     const cx = mouseX;
@@ -367,6 +373,12 @@
     let fy = -(mouseY - lastMouseY) * 110; // flip y for screen → physical
 
     if (Math.abs(fx) < 0.01 && Math.abs(fy) < 0.01) return;
+
+    if (optimizedSolver) {
+      optimizedSolver.applyMouseForce(cx, cy, fx, fy);
+      return;
+    }
+    if (!sim) return;
 
     const forceData = new Float32Array(n * n * 2);
     for (let j1 = 0; j1 < n; j1++) {
@@ -390,13 +402,22 @@
     running = true;
     let lastTime = performance.now();
     let frames = 0;
+    let perfSteps = 0;
+    let perfStepMs = 0;
+    let perfRenderMs = 0;
 
     while (running) {
       if (!paused) {
         applyMouseForce();
         try {
-          const [u2, X2] = stepFn(sim.u, sim.X, pre.a.ref, params);
-          sim = { u: u2, X: X2 };
+          const t0 = perfMode ? performance.now() : 0;
+          if (optimizedSolver) {
+            optimizedSolver.stepBatch(1);
+          } else {
+            const [u2, X2] = stepFn(sim.u, sim.X, pre.a.ref, params);
+            sim = { u: u2, X: X2 };
+          }
+          if (perfMode) perfStepMs += performance.now() - t0;
         } catch (e) {
           console.error(e);
           errorMsg = String(e);
@@ -415,26 +436,44 @@
 
       // Compute the visualization field on the GPU and bind its buffer directly
       // — no CPU readback. The fragment shader does periodic bilinear upsampling.
-      let viz: np.Array;
-      if (vizMode === "vorticity") {
-        viz = computeVorticity(sim.u.ref, params);
+      const renderT0 = perfMode ? performance.now() : 0;
+      if (optimizedSolver) {
+        const fieldBuf = optimizedSolver.renderField(vizMode);
+        renderFrame(fieldBuf, optimizedSolver.boundaryBuffer);
       } else {
-        viz = computeVelMagnitude(sim.u.ref);
+        let viz: np.Array;
+        if (vizMode === "vorticity") {
+          viz = computeVorticity(sim.u.ref, params);
+        } else {
+          viz = computeVelMagnitude(sim.u.ref);
+        }
+        // Keep viz alive across the render. gpuBufferSync() disposes the array
+        // it's called on, and at refcount 0 jax-js calls GPUBuffer.destroy() —
+        // which would invalidate the buffer before renderFrame binds it. Bind via
+        // a temp .ref so viz retains the buffer through submit, then dispose it
+        // (destroy() is deferred by WebGPU until the submitted pass completes).
+        const fieldBuf = viz.ref.gpuBufferSync();
+        const boundBuf = await sim.X.ref.gpuBuffer();
+        renderFrame(fieldBuf, boundBuf);
+        viz.dispose();
       }
-      // Keep viz alive across the render. gpuBufferSync() disposes the array
-      // it's called on, and at refcount 0 jax-js calls GPUBuffer.destroy() —
-      // which would invalidate the buffer before renderFrame binds it. Bind via
-      // a temp .ref so viz retains the buffer through submit, then dispose it
-      // (destroy() is deferred by WebGPU until the submitted pass completes).
-      const fieldBuf = viz.ref.gpuBufferSync();
-      const boundBuf = await sim.X.ref.gpuBuffer();
-      renderFrame(fieldBuf, boundBuf);
-      viz.dispose();
+      if (perfMode) {
+        perfRenderMs += performance.now() - renderT0;
+        perfSteps++;
+      }
 
       // FPS counter
       const now = performance.now();
       if (now - lastTime > 1000) {
         fps = Math.round((frames * 1000) / (now - lastTime));
+        if (perfMode && perfSteps > 0) {
+          console.info(
+            `[ib-sim perf] solver=${solverMode} N=${N} fps=${fps} avgStep=${(perfStepMs / perfSteps).toFixed(3)}ms avgRender=${(perfRenderMs / perfSteps).toFixed(3)}ms`,
+          );
+          perfSteps = 0;
+          perfStepMs = 0;
+          perfRenderMs = 0;
+        }
         frames = 0;
         lastTime = now;
       }
@@ -448,7 +487,28 @@
     autoPaused = false;
   }
 
+  function updateSolverParams() {
+    if (!params) return;
+    params.K = paramK;
+    params.mu = paramMu;
+    params.dt = paramDt;
+    if (optimizedSolver) {
+      optimizedSolver.setParams(params);
+    } else {
+      pre = initFourierOperator(params);
+    }
+  }
+
   function resetSim() {
+    if (optimizedSolver) {
+      params = createParams(N, paramK, paramMu);
+      params.dt = paramDt;
+      optimizedSolver.reset(params);
+      frameCount = 0;
+      paused = false;
+      autoPaused = false;
+      return;
+    }
     if (sim) {
       sim.u.dispose();
       sim.X.dispose();
@@ -462,13 +522,59 @@
     autoPaused = false;
   }
 
-  function changeN(newN: number) {
+  async function changeN(newN: number) {
+    running = false;
+    await new Promise((r) => requestAnimationFrame(r));
     N = newN;
+    paramN = newN;
     paramDt = dtDefault;
-    resetSim();
+    if (optimizedSolver) {
+      optimizedSolver.destroy();
+      optimizedSolver = null;
+      try {
+        await setupOptimizedSolver();
+      } catch (e) {
+        console.warn("Optimized solver unavailable after grid change; using reference path.", e);
+        setupReferenceSolver();
+      }
+    } else {
+      resetSim();
+    }
+    simulate();
+  }
+
+  function setupReferenceSolver() {
+    solverMode = "reference";
+    optimizedSolver = null;
+    if (sim) {
+      sim.u.dispose();
+      sim.X.dispose();
+    }
+    params = createParams(N, paramK, paramMu);
+    params.dt = paramDt;
+    sim = initState(params);
+    pre = initFourierOperator(params);
+    stepFn = createStep();
+    frameCount = 0;
+    paused = false;
+    autoPaused = false;
+  }
+
+  async function setupOptimizedSolver() {
+    solverMode = "optimized";
+    params = createParams(N, paramK, paramMu);
+    params.dt = paramDt;
+    optimizedSolver = await WebGpuIbSolver.init(gpuDevice, params);
+    frameCount = 0;
+    paused = false;
+    autoPaused = false;
   }
 
   async function startup() {
+    const url = new URL(window.location.href);
+    preferredSolver = url.searchParams.get("solver") === "reference" ? "reference" : "optimized";
+    perfMode = url.searchParams.get("perf") === "1";
+
     await init("webgpu");
     defaultDevice("webgpu");
 
@@ -477,13 +583,18 @@
 
     N = paramN;
     paramDt = dtDefault;
-    params = createParams(N, paramK, paramMu);
-    params.dt = paramDt;
-    sim = initState(params);
-    pre = initFourierOperator(params);
-    stepFn = createStep();
 
     await initRenderer();
+    if (preferredSolver === "optimized") {
+      try {
+        await setupOptimizedSolver();
+      } catch (e) {
+        console.warn("Optimized solver unavailable; using reference path.", e);
+        setupReferenceSolver();
+      }
+    } else {
+      setupReferenceSolver();
+    }
     simulate();
   }
 
@@ -494,6 +605,7 @@
     });
     return () => {
       running = false;
+      optimizedSolver?.destroy();
     };
   });
 
@@ -569,8 +681,8 @@
       functions. Click and drag to apply force.
     </p>
     <p class="tech-line">
-      Using <a href="https://github.com/ekzhang/jax-js">jax-js</a> on WebGPU
-      &middot; N={N} &middot; FFT-based IMEX solver &middot; &Delta;t={paramDt.toFixed(4)}
+      WebGPU {solverLabel} solver &middot; N={N} &middot; FFT-based IMEX solver
+      &middot; &Delta;t={paramDt.toFixed(4)}
     </p>
   </header>
 
@@ -581,7 +693,7 @@
 
     <div class="canvas-block">
       <div class="canvas-caption">
-        N={N} &middot; &Delta;t={paramDt.toFixed(4)} &middot; {vizLabel} &middot; {cmapLabel}
+        {solverLabel} &middot; N={N} &middot; &Delta;t={paramDt.toFixed(4)} &middot; {vizLabel} &middot; {cmapLabel}
       </div>
       <div class="canvas-matte">
         <canvas
@@ -613,7 +725,7 @@
             max="5"
             step="0.01"
             bind:value={paramK}
-            oninput={() => { if (params) params.K = paramK; }}
+            oninput={updateSolverParams}
           />
           <span class="param-val">{paramK.toFixed(2)}</span>
         </div>
@@ -629,12 +741,7 @@
             max="0.1"
             step="0.001"
             bind:value={paramMu}
-            oninput={() => {
-              if (params) {
-                params.mu = paramMu;
-                pre = initFourierOperator(params);
-              }
-            }}
+            oninput={updateSolverParams}
           />
           <span class="param-val">{paramMu.toFixed(3)}</span>
         </div>
@@ -650,12 +757,7 @@
             max={dtMax}
             step={dtStep}
             bind:value={paramDt}
-            oninput={() => {
-              if (params) {
-                params.dt = paramDt;
-                pre = initFourierOperator(params);
-              }
-            }}
+            oninput={updateSolverParams}
           />
           <span class="param-val">{paramDt.toFixed(3)}</span>
         </div>
@@ -694,7 +796,7 @@
       <label class="toolbar-field">
         <span class="toolbar-label">Grid</span>
         <div class="select-wrap">
-          <select value={paramN} onchange={(e) => changeN(Number(e.currentTarget.value))}>
+          <select value={paramN} onchange={(e) => void changeN(Number(e.currentTarget.value))}>
             <option value={64}>64 &times; 64</option>
             <option value={128}>128 &times; 128</option>
           </select>
