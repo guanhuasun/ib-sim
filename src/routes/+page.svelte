@@ -54,7 +54,7 @@
     );
   });
   let N = $state(64);
-  const PAUSE_INTERVAL = 1000;
+  const PAUSE_INTERVAL_SECONDS = 20;
   let dtMin = $derived(N === 64 ? 0.002 : 0.001);
   let dtMax = $derived(N === 64 ? 0.02 : 0.01);
   let dtStep = $derived(N === 64 ? 0.001 : 0.0005);
@@ -63,9 +63,11 @@
   let canvas: HTMLCanvasElement;
   let running = false;
   let frameCount = $state(0);
+  let simTime = $state(0);
+  let nextAutoPauseTime = PAUSE_INTERVAL_SECONDS;
   let fps = $state(0);
   let paused = $state(false);
-  let autoPaused = $state(false); // true when auto-paused at interval
+  let autoPaused = $state(false); // true when auto-paused at a simulation-time mark
   let errorMsg = $state("");
   let solverMode = $state<"optimized" | "reference">("reference");
   let perfMode = false;
@@ -78,7 +80,6 @@
   let optimizedSolver: WebGpuIbSolver | null = null;
 
   // Derived
-  let simTime = $derived(frameCount * paramDt);
   let vizLabel = $derived(vizMode === "vorticity" ? "vort" : "|vel|");
   let cmapLabel = $derived(colormapNames[colormap].toLowerCase());
   let solverLabel = $derived(solverMode === "optimized" ? "optimized" : "reference");
@@ -426,11 +427,15 @@
         }
         frameCount++;
         frames++;
+        simTime += params.dt;
 
-        // Auto-pause every PAUSE_INTERVAL steps
-        if (frameCount % PAUSE_INTERVAL === 0) {
+        // Auto-pause every fixed amount of simulated time, independent of dt.
+        if (simTime >= nextAutoPauseTime - 1e-9) {
           paused = true;
           autoPaused = true;
+          while (nextAutoPauseTime <= simTime + 1e-9) {
+            nextAutoPauseTime += PAUSE_INTERVAL_SECONDS;
+          }
         }
       }
 
@@ -487,6 +492,12 @@
     autoPaused = false;
   }
 
+  function resetClock() {
+    frameCount = 0;
+    simTime = 0;
+    nextAutoPauseTime = PAUSE_INTERVAL_SECONDS;
+  }
+
   function updateSolverParams() {
     if (!params) return;
     params.K = paramK;
@@ -504,7 +515,7 @@
       params = createParams(N, paramK, paramMu);
       params.dt = paramDt;
       optimizedSolver.reset(params);
-      frameCount = 0;
+      resetClock();
       paused = false;
       autoPaused = false;
       return;
@@ -517,7 +528,7 @@
     params.dt = paramDt;
     sim = initState(params);
     pre = initFourierOperator(params);
-    frameCount = 0;
+    resetClock();
     paused = false;
     autoPaused = false;
   }
@@ -555,7 +566,7 @@
     sim = initState(params);
     pre = initFourierOperator(params);
     stepFn = createStep();
-    frameCount = 0;
+    resetClock();
     paused = false;
     autoPaused = false;
   }
@@ -565,7 +576,7 @@
     params = createParams(N, paramK, paramMu);
     params.dt = paramDt;
     optimizedSolver = await WebGpuIbSolver.init(gpuDevice, params);
-    frameCount = 0;
+    resetClock();
     paused = false;
     autoPaused = false;
   }
@@ -658,6 +669,10 @@
   }
 </script>
 
+<svelte:head>
+  <title>Interactive 2D Immersed Boundary Method</title>
+</svelte:head>
+
 <main class="ib-sim">
   <nav class="breadcrumb">
     <a href="https://guanhuasun.github.io/">&larr; guanhuasun.github.io</a>
@@ -673,7 +688,7 @@
         href="https://math.nyu.edu/~peskin/ib_lecture_notes/index.html"
         class="title-link"
         target="_blank"
-        rel="noopener noreferrer">2D Immersed Boundary Method</a
+        rel="noopener noreferrer"><span class="title-emphasis">Interactive</span> 2D Immersed Boundary Method</a
       >
     </h1>
     <p class="lede">
@@ -788,7 +803,7 @@
   <section class="toolbar">
     <div class="toolbar-left">
       {#if autoPaused}
-        <span class="auto-pause-msg">Paused at step {frameCount}.</span>
+        <span class="auto-pause-msg">Paused at t = {simTime.toFixed(2)} s.</span>
       {/if}
     </div>
 
@@ -883,6 +898,11 @@
     color: var(--color-link);
     text-decoration: underline;
     text-underline-offset: 3px;
+  }
+  .title-emphasis {
+    color: var(--color-link);
+    font-style: italic;
+    font-weight: 700;
   }
   .lede {
     font-family: var(--font-sans);
