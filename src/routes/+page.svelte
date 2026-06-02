@@ -684,11 +684,12 @@
 
   <header class="page-header">
     <h1>
+      <span class="title-emphasis">Interactive</span>
       <a
         href="https://math.nyu.edu/~peskin/ib_lecture_notes/index.html"
         class="title-link"
         target="_blank"
-        rel="noopener noreferrer"><span class="title-emphasis">Interactive</span> 2D Immersed Boundary Method</a
+        rel="noopener noreferrer">2D Immersed Boundary Method</a
       >
     </h1>
     <p class="lede">
