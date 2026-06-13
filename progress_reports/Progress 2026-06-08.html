@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Research progress log - week of 2026-06-08</title>
+  <style>
+    body { max-width: 860px; margin: 40px auto; padding: 0 20px; font: 16px/1.55 system-ui, sans-serif; color: #1f2933; }
+    h1, h2, h3 { line-height: 1.2; }
+    h1 { font-size: 28px; }
+    h2 { margin-top: 34px; padding-top: 22px; border-top: 1px solid #d8dee4; }
+    code { background: #f2f4f7; padding: 2px 5px; border-radius: 4px; }
+    li { margin: 6px 0; }
+  </style>
+</head>
+<body>
+  <h1>Research progress log - week of 2026-06-08</h1>
+
+  <article>
+    <h2>2026-06-13 (Saturday)</h2>
+
+    <section>
+      <h3>Focus</h3>
+      <p>Built and refined a local 3D immersed-boundary simulation view while keeping the site unpushed for further iteration.</p>
+    </section>
+
+    <section>
+      <h3>Key outputs</h3>
+      <ul>
+        <li><code>src/routes/ib3d-solver.ts</code> - added a WebGPU 3D IB solver with sphere mesh generation, edge-spring forces, 3D Peskin interpolation/spreading, spectral fluid projection, velocity/vorticity scalar-field generation, and fluid impulse support.</li>
+        <li><code>src/routes/3d/+page.svelte</code> - added the 3D Svelte route with raw WebGPU mesh rendering, raymarched velocity/vorticity volume rendering, rotate/stir interaction, grid/mesh/physics controls, and transparent structure rendering.</li>
+        <li><code>src/routes/+page.svelte</code> - added a local navigation link from the 2D simulation to the new 3D simulation page.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h3>Work done</h3>
+      <ul>
+        <li>Ported the 2D IB method shape to 3D by adding one spatial axis in the fluid grid, interpolation, spreading, vorticity, and spectral solve.</li>
+        <li>Implemented direct WebGPU volume visualization inspired by Three.js WebGPU texture/raymarch examples, without adding Three.js as a dependency.</li>
+        <li>Exposed velocity magnitude and vorticity magnitude visualization modes, plus alpha, cutoff, scale, and ray sample controls.</li>
+        <li>Removed the non-physical damping slider from the user interface and fixed the page to use <code>damping: 1.0</code>.</li>
+        <li>Set the structure surface alpha to <code>0.58</code> with blending so the fluid volume remains visible inside the shell while the edge overlay stays crisp.</li>
+        <li>Verified <code>npm run build</code> succeeds and checked the local Chrome/WebGPU page at <code>http://127.0.0.1:5173/3d</code> with no app or WebGPU validation errors.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h3>Open follow-ups</h3>
+      <ul>
+        <li>Do not push or deploy the 3D page yet; it needs more validation before remote publication.</li>
+        <li>Replace the current graph-Laplacian structure force with a more physical rest-length spring, area/volume constraint, or bending model if the 3D structure should preserve shape more faithfully.</li>
+        <li>Add numerical diagnostics for the 3D solver, especially divergence, energy behavior, and parity against a CPU/reference prototype for small grids.</li>
+        <li>Clean up the existing <code>vite.config.ts</code> Node typings issue so <code>npm run check</code> can pass; it still reports missing <code>node:path</code> and <code>__dirname</code>.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h3>Commit</h3>
+      <p><code>9606dee</code> - Add 3D IB simulation view.</p>
+      <p>Push and site deployment were skipped by user request.</p>
+    </section>
+  </article>
+</body>
+</html>
