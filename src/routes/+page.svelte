@@ -676,6 +676,7 @@
 <main class="ib-sim">
   <nav class="breadcrumb">
     <a href="https://guanhuasun.github.io/">&larr; guanhuasun.github.io</a>
+    <a href="3d">3D IB simulation</a>
   </nav>
 
   {#if errorMsg}
