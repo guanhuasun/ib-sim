@@ -15,6 +15,7 @@ An elastic structure is immersed in a viscous, incompressible fluid on a periodi
 The main hot loops are now app-local WebGPU/WGSL kernels rather than general jax-js array programs.
 
 - **2D optimized path:** `src/routes/webgpu-ib-solver.ts` is the default solver for the 2D page. It keeps simulation state in GPU buffers and runs custom WGSL kernels for force computation, spreading, interpolation, FFT-based fluid solves, mouse forcing, and visualization-field generation.
+- **2D rendering:** `src/routes/webgpu-ib-renderer.ts` draws the scalar field and instanced boundary segments/points, including periodic images. The solver caches both ping-pong dispatch schedules; a displayed frame shares one command encoder for simulation, visualization, and drawing. Unchanged paused frames skip GPU work.
 - **2D reference path:** `src/routes/ib-solver.ts` is the original jax-js implementation. It remains available as a numerical reference/fallback and can be forced with `?solver=reference`.
 - **3D path:** `src/routes/ib3d-solver.ts` uses raw WebGPU compute pipelines for a 3D velocity grid, edge-spring structure forces, 3D Peskin coupling, 3D FFT passes, incompressible Fourier projection, and velocity/vorticity scalar-field generation.
 - **jax-js role:** jax-js is still in the project. It provides the retained 2D reference solver and is currently used by the pages to initialize/access the WebGPU device. The active 2D optimized solver and 3D solver do not use jax-js arrays or jax-js FFTs in their fluid-solve hot loops.
@@ -72,14 +73,15 @@ Requires a browser with WebGPU support, such as current Chrome or Edge.
 
 - `?solver=optimized` - use the default 2D optimized WebGPU solver.
 - `?solver=reference` - force the 2D jax-js reference solver.
-- `?perf=1` - log 2D solver/render timing information.
+- `?perf=1` - log FPS and CPU command-encoding times (not GPU execution times).
 
 ## Project Structure
 
 ```text
 src/routes/
-  +page.svelte          # 2D UI, WebGPU rendering, solver selection, animation loop
+  +page.svelte          # 2D UI, solver selection, animation loop
   webgpu-ib-solver.ts   # Optimized 2D raw WebGPU solver
+  webgpu-ib-renderer.ts # Scalar field and periodic instanced boundary rendering
   ib-solver.ts          # Original jax-js 2D reference/fallback solver
   ib3d-solver.ts        # Experimental 3D raw WebGPU solver
   3d/+page.svelte       # 3D UI, mesh rendering, volume rendering, animation loop
@@ -87,6 +89,10 @@ jax-js/                 # Git submodule: jax-js WebGPU array library
 ```
 
 ## Development Notes
+
+`node scripts/check-2d.mjs` runs Chrome/WebGPU regression checks at N=64/128: repeated periodic crossings, spread/interpolation consistency against jax-js, batch versus individual steps through 1,000 steps, shared-encoder submission, and reset from either ping-pong state. It requires Chrome and Playwright tooling; set `PLAYWRIGHT_MODULE` to an existing Playwright `index.mjs` path when it is installed outside this project. The script starts and closes its own local Vite server.
+
+Local before/after measurements using completed GPU work (five alternating, warmed runs) reduced median 100-step batch time from 14.4 to 7.7 ms at N=64 and 19.6 to 11.1 ms at N=128. At a 512x512 canvas, rendering fell from about 0.30/0.57 ms to 0.10 ms per frame. These are machine-specific measurements, not performance guarantees; the page still advances one step per animation frame. Solver states matched the previous optimized implementation exactly through 1,000 steps in these tests.
 
 - Prefer the optimized WebGPU solver for performance-sensitive work.
 - Keep `src/routes/ib-solver.ts` as the reference path unless intentionally changing the 2D numerical baseline.

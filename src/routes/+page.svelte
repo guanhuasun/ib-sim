@@ -19,6 +19,7 @@
     type Precomputed,
   } from "./ib-solver";
   import { WebGpuIbSolver } from "./webgpu-ib-solver";
+  import { WebGpuIbRenderer } from "./webgpu-ib-renderer";
 
   // --- Parameters ---
   let paramK = $state(1.0);
@@ -71,7 +72,6 @@
   let errorMsg = $state("");
   let solverMode = $state<"optimized" | "reference">("reference");
   let perfMode = false;
-  let preferredSolver: "optimized" | "reference" = "optimized";
 
   let params: IBParams;
   let sim: IBState;
@@ -82,7 +82,6 @@
   // Derived
   let vizLabel = $derived(vizMode === "vorticity" ? "vort" : "|vel|");
   let cmapLabel = $derived(colormapNames[colormap].toLowerCase());
-  let solverLabel = $derived(solverMode === "optimized" ? "optimized" : "reference");
 
   // Mouse state
   let mouseDown = $state(false);
@@ -91,274 +90,11 @@
   let lastMouseX = 0;
   let lastMouseY = 0;
 
-  // --- WebGPU Rendering ---
   let gpuDevice: GPUDevice;
-  let renderPipeline: GPURenderPipeline;
-  let renderBindGroupLayout: GPUBindGroupLayout;
-  let canvasContext: GPUCanvasContext;
-  let uniformBuffer: GPUBuffer;
-
-  async function initRenderer() {
-    gpuDevice = getWebGPUDevice();
-    canvasContext = canvas.getContext("webgpu") as GPUCanvasContext;
-    const format = navigator.gpu.getPreferredCanvasFormat();
-    canvasContext.configure({ device: gpuDevice, format, alphaMode: "opaque" });
-
-    const shaderCode = /* wgsl */ `
-      struct Uniforms {
-        texSize: vec2f,
-        fieldScale: f32,
-        nb: u32,
-        pointRadius: f32,
-        lineWidth: f32,
-        vizMode: u32,
-        cmap: u32,
-        invertBg: u32,
-        bilinear: u32,
-      };
-
-      @group(0) @binding(0) var<uniform> u: Uniforms;
-      @group(0) @binding(1) var<storage, read> field: array<f32>;
-      @group(0) @binding(2) var<storage, read> boundary: array<f32>;
-
-      struct VertexOutput {
-        @builtin(position) pos: vec4f,
-        @location(0) uv: vec2f,
-      };
-
-      @vertex fn vs(@builtin(vertex_index) vi: u32) -> VertexOutput {
-        var pos = array<vec2f, 3>(
-          vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3)
-        );
-        var out: VertexOutput;
-        out.pos = vec4f(pos[vi], 0, 1);
-        out.uv = (pos[vi] + 1) * 0.5;
-        return out;
-      }
-
-      // Diverging colormaps: v in [-1,1], center color is c (either black or white).
-      fn cmapCyanMagenta(v: f32, c: vec3f) -> vec3f {
-        let t = clamp(v, -1.0, 1.0);
-        if (t > 0.0) { return mix(c, vec3f(1.0, 0.2, 0.8), t); }
-        else { return mix(c, vec3f(0.0, 0.9, 0.9), -t); }
-      }
-      fn cmapTealOrange(v: f32, c: vec3f) -> vec3f {
-        let t = clamp(v, -1.0, 1.0);
-        if (t > 0.0) { return mix(c, vec3f(1.0, 0.55, 0.1), t); }
-        else { return mix(c, vec3f(0.0, 0.7, 0.65), -t); }
-      }
-      fn cmapRedBlue(v: f32, c: vec3f) -> vec3f {
-        let t = clamp(v, -1.0, 1.0);
-        if (t > 0.0) { return mix(c, vec3f(1.0, 0.2, 0.1), t); }
-        else { return mix(c, vec3f(0.1, 0.4, 1.0), -t); }
-      }
-      // ColorBrewer PuOr (purple <-> orange)
-      fn cmapPurpleOrange(v: f32, c: vec3f) -> vec3f {
-        let t = clamp(v, -1.0, 1.0);
-        if (t > 0.0) { return mix(c, vec3f(0.902, 0.380, 0.004), t); }
-        else { return mix(c, vec3f(0.329, 0.153, 0.533), -t); }
-      }
-      // ColorBrewer BrBG (brown <-> blue-green)
-      fn cmapBrownTeal(v: f32, c: vec3f) -> vec3f {
-        let t = clamp(v, -1.0, 1.0);
-        if (t > 0.0) { return mix(c, vec3f(0.004, 0.400, 0.369), t); }
-        else { return mix(c, vec3f(0.549, 0.318, 0.039), -t); }
-      }
-      // Matplotlib coolwarm endpoints
-      fn cmapCoolwarm(v: f32, c: vec3f) -> vec3f {
-        let t = clamp(v, -1.0, 1.0);
-        if (t > 0.0) { return mix(c, vec3f(0.706, 0.016, 0.149), t); }
-        else { return mix(c, vec3f(0.231, 0.298, 0.753), -t); }
-      }
-
-      fn divergingColor(v: f32, cm: u32, c: vec3f) -> vec3f {
-        switch cm {
-          case 0u: { return cmapCyanMagenta(v, c); }
-          case 1u: { return cmapTealOrange(v, c); }
-          case 2u: { return cmapRedBlue(v, c); }
-          case 3u: { return cmapPurpleOrange(v, c); }
-          case 4u: { return cmapBrownTeal(v, c); }
-          case 5u: { return cmapCoolwarm(v, c); }
-          default: { return cmapCyanMagenta(v, c); }
-        }
-      }
-
-      fn distToSeg(p: vec2f, a: vec2f, b: vec2f) -> f32 {
-        let ab = b - a;
-        let ap = p - a;
-        let t = clamp(dot(ap, ab) / dot(ab, ab), 0.0, 1.0);
-        return length(ap - ab * t);
-      }
-
-      // Periodic distance from point p to point q in [0,1]^2 domain
-      fn periodicPointDist(p: vec2f, q: vec2f) -> f32 {
-        var d = p - q;
-        d = d - round(d);
-        return length(d);
-      }
-
-      // Periodic distance from point p to segment a-b, using nearest periodic image
-      fn periodicSegDist(p: vec2f, a: vec2f, b: vec2f) -> f32 {
-        // Shift a to nearest image of p
-        var da = a - p;
-        da = da - round(da);
-        let a2 = p + da;
-        // Shift b relative to a using shortest periodic offset
-        var db = b - a;
-        db = db - round(db);
-        let b2 = a2 + db;
-        return distToSeg(p, a2, b2);
-      }
-
-      @fragment fn fs(in: VertexOutput) -> @location(0) vec4f {
-        let nGrid = u32(u.texSize.x);
-        let fN = u.texSize.x;
-        let wx = in.uv.x;
-        let wy = in.uv.y;
-
-        // Sample the N×N field buffer directly (node-centered: index k sits at
-        // UV k/N) with periodic wrap. Bilinear when smoothing is on, else
-        // round-to-nearest. This replaces the CPU upsample + GPU readback.
-        var raw: f32;
-        if (u.bilinear == 1u) {
-          let fx = wx * fN;
-          let fy = wy * fN;
-          let i0 = i32(floor(fx));
-          let j0 = i32(floor(fy));
-          let wi = fx - f32(i0);
-          let wj = fy - f32(j0);
-          let ni = i32(nGrid);
-          let ci0 = u32(((i0 % ni) + ni) % ni);
-          let ci1 = u32((((i0 + 1) % ni) + ni) % ni);
-          let cj0 = u32(((j0 % ni) + ni) % ni);
-          let cj1 = u32((((j0 + 1) % ni) + ni) % ni);
-          let vx0 = mix(field[ci0 * nGrid + cj0], field[ci1 * nGrid + cj0], wi);
-          let vx1 = mix(field[ci0 * nGrid + cj1], field[ci1 * nGrid + cj1], wi);
-          raw = mix(vx0, vx1, wj);
-        } else {
-          let px = min(u32(round(wx * fN)), nGrid - 1u);
-          let py = min(u32(round(wy * fN)), nGrid - 1u);
-          raw = field[px * nGrid + py];
-        }
-        let v = raw / u.fieldScale;
-
-        let centerColor = select(vec3f(0.0), vec3f(1.0), u.invertBg == 1u);
-        let segColor    = select(vec3f(0.9), vec3f(0.12), u.invertBg == 1u);
-        let ptColor     = select(vec3f(1.0), vec3f(0.0),  u.invertBg == 1u);
-
-        // Both modes use selected colormap (magnitude uses positive branch)
-        var color = divergingColor(v, u.cmap, centerColor);
-
-        let nb = u.nb;
-        let worldPt = vec2f(wx, wy);
-
-        // Draw segments with periodic wrapping
-        for (var k = 0u; k < nb; k++) {
-          let a = vec2f(boundary[k * 2u], boundary[k * 2u + 1u]);
-          let nk = (k + 1u) % nb;
-          let b = vec2f(boundary[nk * 2u], boundary[nk * 2u + 1u]);
-          let d = periodicSegDist(worldPt, a, b);
-          if (d < u.lineWidth) {
-            let alpha = smoothstep(u.lineWidth, u.lineWidth * 0.3, d);
-            color = mix(color, segColor, alpha);
-          }
-        }
-
-        // Draw points with periodic wrapping
-        for (var k = 0u; k < nb; k++) {
-          let bpt = vec2f(boundary[k * 2u], boundary[k * 2u + 1u]);
-          let dist = periodicPointDist(worldPt, bpt);
-          if (dist < u.pointRadius) {
-            let alpha = smoothstep(u.pointRadius, u.pointRadius * 0.3, dist);
-            color = mix(color, ptColor, alpha);
-          }
-        }
-
-        return vec4f(color, 1.0);
-      }
-    `;
-
-    const shaderModule = gpuDevice.createShaderModule({ code: shaderCode });
-
-    renderBindGroupLayout = gpuDevice.createBindGroupLayout({
-      entries: [
-        {
-          binding: 0,
-          visibility: GPUShaderStage.FRAGMENT,
-          buffer: { type: "uniform" },
-        },
-        {
-          binding: 1,
-          visibility: GPUShaderStage.FRAGMENT,
-          buffer: { type: "read-only-storage" },
-        },
-        {
-          binding: 2,
-          visibility: GPUShaderStage.FRAGMENT,
-          buffer: { type: "read-only-storage" },
-        },
-      ],
-    });
-
-    renderPipeline = gpuDevice.createRenderPipeline({
-      layout: gpuDevice.createPipelineLayout({
-        bindGroupLayouts: [renderBindGroupLayout],
-      }),
-      vertex: { module: shaderModule },
-      fragment: { module: shaderModule, targets: [{ format }] },
-    });
-
-    uniformBuffer = gpuDevice.createBuffer({
-      size: 48,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-  }
-
-  function renderFrame(fieldBuf: GPUBuffer, boundBuffer: GPUBuffer) {
-    const pointRadius = 0.6 / (64 * 2);
-    const lineWidth = 0.4 / (64 * 2);
-    const uniformData = new Float32Array(12); // 48 bytes
-    uniformData[0] = params.N;
-    uniformData[1] = params.N;
-    uniformData[2] = vizMode === "vorticity" ? 3.0 : 1.0;
-    uniformData[4] = pointRadius;
-    uniformData[5] = lineWidth;
-    new Uint32Array(uniformData.buffer, 12, 1)[0] = params.Nb;
-    new Uint32Array(uniformData.buffer, 24, 1)[0] = vizMode === "vorticity" ? 0 : 1;
-    new Uint32Array(uniformData.buffer, 28, 1)[0] = colormap;
-    new Uint32Array(uniformData.buffer, 32, 1)[0] = invertBg ? 1 : 0;
-    new Uint32Array(uniformData.buffer, 36, 1)[0] = smooth ? 1 : 0;
-    gpuDevice.queue.writeBuffer(uniformBuffer, 0, uniformData);
-
-    const bindGroup = gpuDevice.createBindGroup({
-      layout: renderBindGroupLayout,
-      entries: [
-        { binding: 0, resource: { buffer: uniformBuffer } },
-        { binding: 1, resource: { buffer: fieldBuf } },
-        { binding: 2, resource: { buffer: boundBuffer } },
-      ],
-    });
-
-    const encoder = gpuDevice.createCommandEncoder();
-    const pass = encoder.beginRenderPass({
-      colorAttachments: [
-        {
-          view: canvasContext.getCurrentTexture().createView(),
-          loadOp: "clear",
-          storeOp: "store",
-          clearValue: { r: 0, g: 0, b: 0, a: 1 },
-        },
-      ],
-    });
-    pass.setPipeline(renderPipeline);
-    pass.setBindGroup(0, bindGroup);
-    pass.draw(3);
-    pass.end();
-    gpuDevice.queue.submit([encoder.finish()]);
-  }
+  let renderer: WebGpuIbRenderer;
 
   // --- Apply localized Gaussian force from mouse ---
-  function applyMouseForce() {
+  function applyMouseForce(encoder?: GPUCommandEncoder) {
     if (!mouseDown || !params) return;
 
     const { N: n, h } = params;
@@ -370,13 +106,13 @@
     const sigma2 = sigma * sigma;
 
     // Drag direction in physical coords
-    let fx = (mouseX - lastMouseX) * 110;
-    let fy = -(mouseY - lastMouseY) * 110; // flip y for screen → physical
+    const fx = (mouseX - lastMouseX) * 110;
+    const fy = -(mouseY - lastMouseY) * 110; // flip y for screen → physical
 
     if (Math.abs(fx) < 0.01 && Math.abs(fy) < 0.01) return;
 
     if (optimizedSolver) {
-      optimizedSolver.applyMouseForce(cx, cy, fx, fy);
+      optimizedSolver.applyMouseForce(cx, cy, fx, fy, encoder);
       return;
     }
     if (!sim) return;
@@ -406,14 +142,18 @@
     let perfSteps = 0;
     let perfStepMs = 0;
     let perfRenderMs = 0;
+    let lastView = "";
 
     while (running) {
-      if (!paused) {
-        applyMouseForce();
+      let encoder: GPUCommandEncoder | undefined;
+      const advance = !paused;
+      if (advance) {
+        if (optimizedSolver) encoder = gpuDevice.createCommandEncoder();
+        applyMouseForce(encoder);
         try {
           const t0 = perfMode ? performance.now() : 0;
           if (optimizedSolver) {
-            optimizedSolver.stepBatch(1);
+            optimizedSolver.stepBatch(1, encoder);
           } else {
             const [u2, X2] = stepFn(sim.u, sim.X, pre.a.ref, params);
             sim = { u: u2, X: X2 };
@@ -439,32 +179,33 @@
         }
       }
 
-      // Compute the visualization field on the GPU and bind its buffer directly
-      // — no CPU readback. The fragment shader does periodic bilinear upsampling.
-      const renderT0 = perfMode ? performance.now() : 0;
-      if (optimizedSolver) {
-        const fieldBuf = optimizedSolver.renderField(vizMode);
-        renderFrame(fieldBuf, optimizedSolver.boundaryBuffer);
-      } else {
-        let viz: np.Array;
-        if (vizMode === "vorticity") {
-          viz = computeVorticity(sim.u.ref, params);
+      // Paused frames need no GPU work unless a display control changes.
+      const view = `${frameCount}:${N}:${vizMode}:${colormap}:${invertBg}:${smooth}`;
+      if (advance || view !== lastView) {
+        lastView = view;
+        const renderT0 = perfMode ? performance.now() : 0;
+        if (optimizedSolver) {
+          encoder ??= gpuDevice.createCommandEncoder();
+          const fieldBuf = optimizedSolver.renderField(vizMode, encoder);
+          renderer.render(fieldBuf, optimizedSolver.boundaryBuffer, params, { vizMode, colormap, invertBg, smooth }, encoder);
         } else {
-          viz = computeVelMagnitude(sim.u.ref);
+          let viz: np.Array;
+          if (vizMode === "vorticity") {
+            viz = computeVorticity(sim.u.ref, params);
+          } else {
+            viz = computeVelMagnitude(sim.u.ref);
+          }
+          // Keep jax-js arrays alive until rendering is submitted.
+          const fieldBuf = viz.ref.gpuBufferSync();
+          const boundBuf = await sim.X.ref.gpuBuffer();
+          if (!running) { viz.dispose(); break; }
+          renderer.render(fieldBuf, boundBuf, params, { vizMode, colormap, invertBg, smooth });
+          viz.dispose();
         }
-        // Keep viz alive across the render. gpuBufferSync() disposes the array
-        // it's called on, and at refcount 0 jax-js calls GPUBuffer.destroy() —
-        // which would invalidate the buffer before renderFrame binds it. Bind via
-        // a temp .ref so viz retains the buffer through submit, then dispose it
-        // (destroy() is deferred by WebGPU until the submitted pass completes).
-        const fieldBuf = viz.ref.gpuBufferSync();
-        const boundBuf = await sim.X.ref.gpuBuffer();
-        renderFrame(fieldBuf, boundBuf);
-        viz.dispose();
-      }
-      if (perfMode) {
-        perfRenderMs += performance.now() - renderT0;
-        perfSteps++;
+        if (perfMode) {
+          perfRenderMs += performance.now() - renderT0;
+          perfSteps++;
+        }
       }
 
       // FPS counter
@@ -473,7 +214,7 @@
         fps = Math.round((frames * 1000) / (now - lastTime));
         if (perfMode && perfSteps > 0) {
           console.info(
-            `[ib-sim perf] solver=${solverMode} N=${N} fps=${fps} avgStep=${(perfStepMs / perfSteps).toFixed(3)}ms avgRender=${(perfRenderMs / perfSteps).toFixed(3)}ms`,
+            `[ib-sim perf] solver=${solverMode} N=${N} fps=${fps} stepEncodeCPU=${(perfStepMs / perfSteps).toFixed(3)}ms renderEncodeCPU=${(perfRenderMs / perfSteps).toFixed(3)}ms`,
           );
           perfSteps = 0;
           perfStepMs = 0;
@@ -506,28 +247,23 @@
     if (optimizedSolver) {
       optimizedSolver.setParams(params);
     } else {
+      pre?.a.dispose();
       pre = initFourierOperator(params);
     }
   }
 
   function resetSim() {
-    if (optimizedSolver) {
-      params = createParams(N, paramK, paramMu);
-      params.dt = paramDt;
-      optimizedSolver.reset(params);
-      resetClock();
-      paused = false;
-      autoPaused = false;
-      return;
-    }
-    if (sim) {
-      sim.u.dispose();
-      sim.X.dispose();
-    }
     params = createParams(N, paramK, paramMu);
     params.dt = paramDt;
-    sim = initState(params);
-    pre = initFourierOperator(params);
+    if (optimizedSolver) {
+      optimizedSolver.reset(params);
+    } else {
+      sim?.u.dispose();
+      sim?.X.dispose();
+      pre?.a.dispose();
+      sim = initState(params);
+      pre = initFourierOperator(params);
+    }
     resetClock();
     paused = false;
     autoPaused = false;
@@ -557,18 +293,8 @@
   function setupReferenceSolver() {
     solverMode = "reference";
     optimizedSolver = null;
-    if (sim) {
-      sim.u.dispose();
-      sim.X.dispose();
-    }
-    params = createParams(N, paramK, paramMu);
-    params.dt = paramDt;
-    sim = initState(params);
-    pre = initFourierOperator(params);
     stepFn = createStep();
-    resetClock();
-    paused = false;
-    autoPaused = false;
+    resetSim();
   }
 
   async function setupOptimizedSolver() {
@@ -583,7 +309,7 @@
 
   async function startup() {
     const url = new URL(window.location.href);
-    preferredSolver = url.searchParams.get("solver") === "reference" ? "reference" : "optimized";
+    const preferredSolver = url.searchParams.get("solver") === "reference" ? "reference" : "optimized";
     perfMode = url.searchParams.get("perf") === "1";
 
     await init("webgpu");
@@ -595,7 +321,8 @@
     N = paramN;
     paramDt = dtDefault;
 
-    await initRenderer();
+    gpuDevice = getWebGPUDevice();
+    renderer = new WebGpuIbRenderer(gpuDevice, canvas);
     if (preferredSolver === "optimized") {
       try {
         await setupOptimizedSolver();
@@ -617,6 +344,10 @@
     return () => {
       running = false;
       optimizedSolver?.destroy();
+      sim?.u.dispose();
+      sim?.X.dispose();
+      pre?.a.dispose();
+      renderer?.destroy();
     };
   });
 
@@ -698,7 +429,7 @@
       functions. Click and drag to apply force.
     </p>
     <p class="tech-line">
-      WebGPU {solverLabel} solver &middot; N={N} &middot; FFT-based IMEX solver
+      WebGPU {solverMode} solver &middot; N={N} &middot; FFT-based IMEX solver
       &middot; &Delta;t={paramDt.toFixed(4)}
     </p>
   </header>
@@ -710,7 +441,7 @@
 
     <div class="canvas-block">
       <div class="canvas-caption">
-        {solverLabel} &middot; N={N} &middot; &Delta;t={paramDt.toFixed(4)} &middot; {vizLabel} &middot; {cmapLabel}
+        {solverMode} &middot; N={N} &middot; &Delta;t={paramDt.toFixed(4)} &middot; {vizLabel} &middot; {cmapLabel}
       </div>
       <div class="canvas-matte">
         <canvas
@@ -1220,5 +951,14 @@
     font-size: 11px;
     color: var(--color-text-caption);
     pointer-events: none;
+  }
+  @media (max-width: 860px) {
+    .sim-area { flex-direction: column; }
+    .spacer { display: none; }
+    .canvas-block { width: 100%; max-width: 538px; }
+    .canvas-matte { width: 100%; box-sizing: border-box; }
+    canvas { width: 100%; height: auto; aspect-ratio: 1; }
+    .param-panel { width: 100%; flex: auto; padding-top: 0; }
+    .copyright { position: static; text-align: right; margin: 16px; }
   }
 </style>
