@@ -261,9 +261,9 @@ function buildGridWeight(X: np.Array, p: IBParams): np.Array {
 
   const offsets = np.array(new Int32Array([-1, 0, 1, 2]), { shape: [4] });
 
-  // Indices: (floor + offset + N) % N
-  const i1 = if0.reshape([-1, 1]).add(offsets.ref).add(N).mod(N); // [Nb, 4]
-  const i2 = if1.reshape([-1, 1]).add(offsets).add(N).mod(N);
+  // Coordinates stay unwrapped; normalize signed remainders after any number of crossings.
+  const i1 = if0.reshape([-1, 1]).add(offsets.ref).mod(N).add(N).mod(N); // [Nb, 4]
+  const i2 = if1.reshape([-1, 1]).add(offsets).mod(N).add(N).mod(N);
 
   const gridIdx = np.arange(N).astype(DType.Int32); // [N]
 

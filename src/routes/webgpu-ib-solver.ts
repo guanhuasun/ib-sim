@@ -31,8 +31,9 @@ type PipelineKey =
   | "ifft1"
   | "ifft0Real";
 
-const PARAM_FLOATS = 8;
+const PARAM_FLOATS = 6;
 const TWO_PI = Math.PI * 2;
+type Dispatch = { pipeline: GPUComputePipeline; bindGroup: GPUBindGroup; count: number };
 const PIPELINE_BINDINGS: Record<PipelineKey, { inputs: number[]; outputs: number[] }> = {
   predict: { inputs: [0, 1, 2], outputs: [3] },
   force: { inputs: [0, 4], outputs: [5] },
@@ -52,12 +53,17 @@ export class WebGpuIbSolver {
   readonly fieldBuffer: GPUBuffer;
 
   #buffers: GpuBuffers;
-  #pipelines = new Map<PipelineKey, GPUComputePipeline>();
+  #pipelines: Map<PipelineKey, GPUComputePipeline>;
   #paramBuffer: GPUBuffer;
   #mouseBuffer: GPUBuffer;
   #vizModeBuffer: GPUBuffer;
   #params: IBParams;
   #destroyed = false;
+  #phase = 0;
+  #steps: Dispatch[][] = [];
+  #mouse: Dispatch[] = [];
+  #viz: Dispatch[] = [];
+  #vizMode: VizMode | undefined;
 
   private constructor(
     readonly device: GPUDevice,
@@ -76,6 +82,14 @@ export class WebGpuIbSolver {
     this.#vizModeBuffer = vizModeBuffer;
     this.#pipelines = pipelines;
     this.#writeParams();
+    // Prebind both ping-pong states; no bind groups or schedules are allocated per step.
+    for (let phase = 0; phase < 2; phase++) {
+      this.#steps.push(this.#createStep());
+      const grid = Math.ceil(params.N * params.N / 256);
+      this.#mouse.push(this.#command("mouse", [paramBuffer, mouseBuffer], [buffers.u], grid));
+      this.#viz.push(this.#command("viz", [paramBuffer, vizModeBuffer, buffers.u], [buffers.field], grid));
+      this.#swap();
+    }
   }
 
   static async init(device: GPUDevice, params: IBParams) {
@@ -83,6 +97,8 @@ export class WebGpuIbSolver {
       throw new Error(`Optimized WebGPU solver supports N=64 or N=128, got ${params.N}`);
     }
 
+    // Compile before allocating state so a shader failure can fall back without leaking buffers.
+    const pipelines = await createPipelines(device, params);
     const buffers = createBuffers(device, params);
     const paramBuffer = device.createBuffer({
       size: PARAM_FLOATS * 4,
@@ -96,7 +112,6 @@ export class WebGpuIbSolver {
       size: 4,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
-    const pipelines = await createPipelines(device, params);
     return new WebGpuIbSolver(
       device,
       params,
@@ -112,73 +127,50 @@ export class WebGpuIbSolver {
     return this.#buffers.X;
   }
 
-  get params() {
-    return this.#params;
-  }
-
   setParams(params: IBParams) {
+    this.#assertAlive();
+    if (params.N !== this.#params.N || params.Nb !== this.#params.Nb) {
+      throw new Error("Create a new optimized solver to resize the grid or boundary");
+    }
     this.#params = { ...params };
     this.#writeParams();
   }
 
   reset(params: IBParams) {
     this.#assertAlive();
-    if (params.N !== this.#params.N || params.Nb !== this.#params.Nb) {
-      this.destroy();
-      throw new Error("reset() cannot resize an existing optimized solver");
-    }
-    this.#params = { ...params };
-    this.#writeParams();
+    this.setParams(params);
 
     const { u, X } = initialData(params);
     this.device.queue.writeBuffer(this.#buffers.u, 0, u);
     this.device.queue.writeBuffer(this.#buffers.X, 0, X);
   }
 
-  applyMouseForce(x: number, y: number, dx: number, dy: number) {
+  applyMouseForce(x: number, y: number, dx: number, dy: number, encoder?: GPUCommandEncoder) {
     this.#assertAlive();
     const data = new Float32Array([x, y, dx, dy]);
     this.device.queue.writeBuffer(this.#mouseBuffer, 0, data);
-    const encoder = this.device.createCommandEncoder();
-    this.#dispatch(encoder, "mouse", [this.#paramBuffer, this.#mouseBuffer], [this.#buffers.u], [
-      Math.ceil((this.#params.N * this.#params.N) / 256),
-    ]);
-    this.device.queue.submit([encoder.finish()]);
+    this.#encode(this.#mouse[this.#phase], encoder);
   }
 
-  stepBatch(count = 1) {
+  stepBatch(count = 1, encoder?: GPUCommandEncoder) {
     this.#assertAlive();
-    const encoder = this.device.createCommandEncoder();
+    const commands = encoder ?? this.device.createCommandEncoder();
+    const pass = commands.beginComputePass();
     for (let i = 0; i < count; i++) {
-      this.#encodeStep(encoder);
-      [this.#buffers.u, this.#buffers.uNext] = [
-        this.#buffers.uNext,
-        this.#buffers.u,
-      ];
-      [this.#buffers.X, this.#buffers.XNext] = [
-        this.#buffers.XNext,
-        this.#buffers.X,
-      ];
+      for (const command of this.#steps[this.#phase]) dispatch(pass, command);
+      this.#swap();
     }
-    this.device.queue.submit([encoder.finish()]);
+    pass.end();
+    if (!encoder) this.device.queue.submit([commands.finish()]);
   }
 
-  renderField(vizMode: VizMode) {
+  renderField(vizMode: VizMode, encoder?: GPUCommandEncoder) {
     this.#assertAlive();
-    this.device.queue.writeBuffer(
-      this.#vizModeBuffer,
-      0,
-      new Uint32Array([vizMode === "vorticity" ? 0 : 1]),
-    );
-    const encoder = this.device.createCommandEncoder();
-    this.#dispatch(
-      encoder,
-      "viz",
-      [this.#paramBuffer, this.#vizModeBuffer, this.#buffers.u],
-      [this.#buffers.field],
-      [Math.ceil((this.#params.N * this.#params.N) / 256)],
-    );
-    this.device.queue.submit([encoder.finish()]);
+    if (vizMode !== this.#vizMode) {
+      this.device.queue.writeBuffer(this.#vizModeBuffer, 0, new Uint32Array([vizMode === "vorticity" ? 0 : 1]));
+      this.#vizMode = vizMode;
+    }
+    this.#encode(this.#viz[this.#phase], encoder);
     return this.#buffers.field;
   }
 
@@ -189,54 +181,47 @@ export class WebGpuIbSolver {
     this.#paramBuffer.destroy();
     this.#mouseBuffer.destroy();
     this.#vizModeBuffer.destroy();
+    this.#steps = [];
+    this.#mouse = [];
+    this.#viz = [];
   }
 
-  #encodeStep(encoder: GPUCommandEncoder) {
-    const n = this.#params.N;
-    const nb = this.#params.Nb;
-    const grid: [number] = [Math.ceil((n * n) / 256)];
-    const boundaryGrid: [number] = [Math.ceil(nb / 128)];
-
-    this.#dispatch(encoder, "predict", [this.#paramBuffer, this.#buffers.u, this.#buffers.X], [this.#buffers.XMid], boundaryGrid);
-    this.#dispatch(encoder, "force", [this.#paramBuffer, this.#buffers.XMid], [this.#buffers.F], boundaryGrid);
-    this.#dispatch(encoder, "spread", [this.#paramBuffer, this.#buffers.XMid, this.#buffers.F], [this.#buffers.ff], grid);
-
-    this.#dispatch(encoder, "w1", [this.#paramBuffer, this.#buffers.u, this.#buffers.ff], [this.#buffers.w], grid);
-    this.#encodeFluidSolve(encoder, this.#buffers.w, this.#buffers.uHalf);
-
-    this.#dispatch(encoder, "w2", [this.#paramBuffer, this.#buffers.u, this.#buffers.uHalf, this.#buffers.ff], [this.#buffers.w], grid);
-    this.#encodeFluidSolve(encoder, this.#buffers.w, this.#buffers.uNext);
-
-    this.#dispatch(encoder, "updateX", [this.#paramBuffer, this.#buffers.uHalf, this.#buffers.X, this.#buffers.XMid], [this.#buffers.XNext], boundaryGrid);
+  #swap() {
+    const b = this.#buffers;
+    [b.u, b.uNext] = [b.uNext, b.u];
+    [b.X, b.XNext] = [b.XNext, b.X];
+    this.#phase ^= 1;
   }
 
-  #encodeFluidSolve(
-    encoder: GPUCommandEncoder,
-    inputReal: GPUBuffer,
-    outputReal: GPUBuffer,
-  ) {
-    const n = this.#params.N;
-    this.#dispatch(encoder, "fft0Real", [inputReal], [this.#buffers.zA], [n]);
-    this.#dispatch(
-      encoder,
-      "fft1Op",
-      [this.#paramBuffer, this.#buffers.zA],
-      [this.#buffers.zB],
-      [n],
-    );
-    this.#dispatch(encoder, "ifft1", [this.#buffers.zB], [this.#buffers.zA], [n]);
-    this.#dispatch(encoder, "ifft0Real", [this.#buffers.zA], [outputReal], [n]);
+  #createStep(): Dispatch[] {
+    const { N, Nb } = this.#params;
+    const b = this.#buffers, p = this.#paramBuffer;
+    const grid = Math.ceil(N * N / 256), boundary = Math.ceil(Nb / 128);
+    const fluid = (output: GPUBuffer) => [
+      this.#command("fft0Real", [b.w], [b.zA], N),
+      this.#command("fft1Op", [p, b.zA], [b.zB], N),
+      this.#command("ifft1", [b.zB], [b.zA], N),
+      this.#command("ifft0Real", [b.zA], [output], N),
+    ];
+    return [
+      this.#command("predict", [p, b.u, b.X], [b.XMid], boundary),
+      this.#command("force", [p, b.XMid], [b.F], boundary),
+      this.#command("spread", [p, b.XMid, b.F], [b.ff], grid),
+      this.#command("w1", [p, b.u, b.ff], [b.w], grid),
+      ...fluid(b.uHalf),
+      this.#command("w2", [p, b.u, b.uHalf, b.ff], [b.w], grid),
+      ...fluid(b.uNext),
+      this.#command("updateX", [p, b.uHalf, b.X, b.XMid], [b.XNext], boundary),
+    ];
   }
 
-  #dispatch(
-    encoder: GPUCommandEncoder,
+  #command(
     key: PipelineKey,
     inputs: GPUBuffer[],
     outputs: GPUBuffer[],
-    grid: [number, number?],
-  ) {
-    const pipeline = this.#pipelines.get(key);
-    if (!pipeline) throw new Error(`Missing optimized pipeline: ${key}`);
+    count: number,
+  ): Dispatch {
+    const pipeline = this.#pipelines.get(key)!;
     const bindings = PIPELINE_BINDINGS[key];
     const entries: GPUBindGroupEntry[] = [];
     for (let i = 0; i < inputs.length; i++) {
@@ -246,18 +231,21 @@ export class WebGpuIbSolver {
       entries.push({ binding: bindings.outputs[i], resource: { buffer: outputs[i] } });
     }
 
-    const bindGroups: GPUBindGroup[] = [
-      this.device.createBindGroup({
+    return {
+      pipeline, count,
+      bindGroup: this.device.createBindGroup({
         layout: pipeline.getBindGroupLayout(0),
         entries,
       }),
-    ];
+    };
+  }
 
-    const pass = encoder.beginComputePass();
-    pass.setPipeline(pipeline);
-    pass.setBindGroup(0, bindGroups[0]);
-    pass.dispatchWorkgroups(grid[0], grid[1] ?? 1);
+  #encode(command: Dispatch, encoder?: GPUCommandEncoder) {
+    const commands = encoder ?? this.device.createCommandEncoder();
+    const pass = commands.beginComputePass();
+    dispatch(pass, command);
     pass.end();
+    if (!encoder) this.device.queue.submit([commands.finish()]);
   }
 
   #writeParams() {
@@ -269,8 +257,6 @@ export class WebGpuIbSolver {
       p.K,
       p.h,
       p.dtheta,
-      p.N,
-      p.Nb,
     ]);
     this.device.queue.writeBuffer(this.#paramBuffer, 0, data);
   }
@@ -278,6 +264,12 @@ export class WebGpuIbSolver {
   #assertAlive() {
     if (this.#destroyed) throw new Error("Optimized WebGPU solver has been destroyed");
   }
+}
+
+function dispatch(pass: GPUComputePassEncoder, { pipeline, bindGroup, count }: Dispatch) {
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(count);
 }
 
 function createBuffers(device: GPUDevice, params: IBParams): GpuBuffers {
@@ -345,17 +337,13 @@ async function createPipelines(device: GPUDevice, params: IBParams) {
     ["ifft1", "ifft_axis1"],
     ["ifft0Real", "ifft_axis0_real"],
   ];
-  const pipelines = new Map<PipelineKey, GPUComputePipeline>();
-  for (const [key, entryPoint] of entries) {
-    pipelines.set(
-      key,
-      await device.createComputePipelineAsync({
-        layout: "auto",
-        compute: { module, entryPoint },
-      }),
-    );
-  }
-  return pipelines;
+  return new Map(await Promise.all(entries.map(async ([key, entryPoint]) => [
+    key,
+    await device.createComputePipelineAsync({
+      layout: "auto",
+      compute: { module, entryPoint },
+    }),
+  ] as const)));
 }
 
 function solverShader({ N, Nb }: IBParams) {
@@ -389,14 +377,6 @@ fn wrap_i(v: i32) -> u32 {
   return u32(((v % n) + n) % n);
 }
 
-fn cadd(a: vec4f, b: vec4f) -> vec4f {
-  return a + b;
-}
-
-fn csub(a: vec4f, b: vec4f) -> vec4f {
-  return a - b;
-}
-
 fn cmul(a: vec4f, wr: f32, wi: f32) -> vec4f {
   return vec4f(
     a.x * wr - a.y * wi,
@@ -428,7 +408,7 @@ fn phi(r: f32, offset: i32) -> f32 {
 fn weight_for_grid(j: u32, s: f32) -> f32 {
   let base = i32(floor(s));
   let r = s - f32(base);
-  let d = (i32(j) - base + i32(N)) % i32(N);
+  let d = i32(wrap_i(i32(j) - base));
   if (d == i32(N) - 1) { return phi(r, -1); }
   if (d == 0) { return phi(r, 0); }
   if (d == 1) { return phi(r, 1); }
@@ -506,8 +486,8 @@ fn fft_shared(tid: u32, inverse: bool) {
       let w = vec2f(cos(angle), sin(angle));
       let a = fft_data[i0];
       let b = cmul(fft_data[i1], w.x, w.y);
-      fft_data[i0] = cadd(a, b);
-      fft_data[i1] = csub(a, b);
+      fft_data[i0] = a + b;
+      fft_data[i1] = a - b;
     }
     workgroupBarrier();
   }
@@ -557,8 +537,10 @@ fn spread_force(@builtin(global_invocation_id) id: vec3u) {
   var f = vec2f(0.0);
   for (var k = 0u; k < NB; k++) {
     let sx = x_spread[k * 2u] / h();
+    let wx = weight_for_grid(i, sx);
+    if (wx == 0.0) { continue; }
     let sy = x_spread[k * 2u + 1u] / h();
-    let w = weight_for_grid(i, sx) * weight_for_grid(j, sy);
+    let w = wx * weight_for_grid(j, sy);
     f += w * vec2f(force_in[k * 2u], force_in[k * 2u + 1u]);
   }
   f *= dtheta() / (h() * h());
