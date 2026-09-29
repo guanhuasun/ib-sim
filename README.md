@@ -27,8 +27,8 @@ The main hot loops are now app-local WebGPU/WGSL kernels rather than general jax
 The 2D scheme follows the MATLAB implementation in `ib_matlab_2D` (C.S. Peskin):
 
 - **Fluid:** 2-stage IMEX time integration. Advection and forcing are explicit; viscous diffusion is implicit through a Fourier-space solve.
-- **Structure:** Elastic spring forces with periodic indexing and a midpoint predictor step.
-- **Coupling:** Spread and interpolation use Peskin's 4-point regularized delta function.
+- **Structure:** Elastic spring forces `F_k = K(X_(k+1) + X_(k-1) - 2X_k)/Δθ²` with periodic indexing and a midpoint predictor step.
+- **Coupling:** Spread and interpolation use Peskin's 4-point regularized delta function. Structural coordinates remain unwrapped; grid indices wrap correctly after repeated crossings in either direction.
 
 ### 3D
 
@@ -71,6 +71,8 @@ Open:
 - `http://127.0.0.1:5173/3d` for the experimental 3D simulator.
 
 Requires a browser with WebGPU support, such as current Chrome or Edge.
+
+For a local production preview, run `npm run build` followed by `npm run preview -- --host 127.0.0.1`.
 
 ## Useful Query Parameters
 
