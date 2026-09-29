@@ -1,627 +1,778 @@
 <script lang="ts">
   import { defaultDevice, getWebGPUDevice, init } from "@jax-js/jax";
   import { onMount } from "svelte";
-
-  import { WebGpuIb3DSolver, type IB3DFieldMode, type IB3DParams } from "../ib3d-solver";
+  import SimulationNav from "$lib/SimulationNav.svelte";
+  import { MOUSE, Plane, Vector3 } from "three";
+  import {
+    WebGpuIb3DSolver,
+    type IB3DFieldMode,
+    type IB3DParams,
+  } from "../ib3d-solver";
+  import { Ib3DRenderer, type ViewOptions } from "./renderer";
 
   let canvas: HTMLCanvasElement;
   let device: GPUDevice;
-  let context: GPUCanvasContext;
-  let format: GPUTextureFormat;
-  let volumePipeline: GPURenderPipeline;
-  let surfacePipeline: GPURenderPipeline;
-  let edgePipeline: GPURenderPipeline;
-  let uniformBuffer: GPUBuffer;
-  let depthTexture: GPUTexture | null = null;
-  let depthView: GPUTextureView | null = null;
+  let renderer: Ib3DRenderer | null = null;
   let solver: WebGpuIb3DSolver | null = null;
-  let running = false;
-  let pointerDown = false;
-  let lastX = 0;
-  let lastY = 0;
-  let yaw = $state(-0.65);
-  let pitch = $state(0.35);
-  let step = $state(0);
-  let fps = $state(0);
-  let simTime = $state(0);
+  let disposed = false;
+  let frameId = 0;
+  let revision = 0;
+  let gesture = 0;
+  let pointerId: number | null = null;
+  let activeDrag: "picking" | "body" | "fluid" | null = null;
+  let latestPointer: { x: number; y: number } | null = null;
+  let plane = new Plane();
+  let previous: Vector3 | null = null;
+  let cursor: Vector3 | null = null;
+  let grabbed = -1;
+  let grabOffset = new Vector3();
+  let lastFrame = 0;
+  let frames = 0;
+  let busy = $state(true);
   let paused = $state(false);
+  let step = $state(0);
+  let simTime = $state(0);
+  let fps = $state(0);
   let errorMsg = $state("");
-  let dragMode = $state<"rotate" | "stir">("rotate");
+  let status = $state("Preparing the simulation…");
+  let mode = $state<"auto" | "fluid" | "body">("auto");
+  let field = $state<IB3DFieldMode>("vorticity");
+  let view = $state<ViewOptions["view"]>("slice");
+  let component = $state(0);
+  let axis = $state(2);
+  let depth = $state(0.5);
+  let fieldScale = $state(0.5);
+  let opacity = $state(0.85);
+  let surface = $state(0.18);
+  let arrows = $state(true);
   let paramN = $state(32);
   let paramRefine = $state(2);
   let paramK = $state(0.006);
   let paramMu = $state(0.01);
   let paramDt = $state(0.002);
-  let stepsPerFrame = $state(1);
-  let volumeMode = $state<IB3DFieldMode | "off">("velocity");
-  let volumeOpacity = $state(0.055);
-  let volumeThreshold = $state(0.08);
-  let volumeScale = $state(0.08);
-  let volumeSamples = $state(96);
+  let stepsPerFrame = $state(6);
   let meshStats = $state("");
-
+  const axes = ["x", "y", "z"];
+  const inDomain = (p: Vector3) => p.toArray().every((v) => v >= 0 && v <= 1);
   function makeParams(): IB3DParams {
     return {
       N: paramN,
       dt: paramDt,
       K: paramK,
       mu: paramMu,
-      damping: 1.0,
       refinement: paramRefine,
       radius: 0.28,
     };
   }
-
-  async function initWebGPU() {
-    await init("webgpu");
-    defaultDevice("webgpu");
-    device = getWebGPUDevice();
-    device.addEventListener("uncapturederror", (event) => {
-      const message = event.error?.message ?? String(event.error);
-      console.error("IB3D WebGPU error:", message);
-      errorMsg = message;
-    });
-    context = canvas.getContext("webgpu") as GPUCanvasContext;
-    format = navigator.gpu.getPreferredCanvasFormat();
-    context.configure({ device, format, alphaMode: "opaque" });
-    uniformBuffer = device.createBuffer({
-      size: 24 * 4,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-    const volumeModule = device.createShaderModule({ code: volumeShader() });
-    volumePipeline = device.createRenderPipeline({
-      layout: "auto",
-      vertex: { module: volumeModule, entryPoint: "vs" },
-      fragment: {
-        module: volumeModule,
-        entryPoint: "fs",
-        targets: [{
-          format,
-          blend: {
-            color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha" },
-            alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha" },
-          },
-        }],
-      },
-      primitive: { topology: "triangle-list" },
-      depthStencil: { format: "depth24plus", depthWriteEnabled: false, depthCompare: "always" },
-    });
-    const surfaceModule = device.createShaderModule({ code: surfaceShader() });
-    surfacePipeline = device.createRenderPipeline({
-      layout: "auto",
-      vertex: { module: surfaceModule, entryPoint: "vs" },
-      fragment: {
-        module: surfaceModule,
-        entryPoint: "fs",
-        targets: [{
-          format,
-          blend: {
-            color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha" },
-            alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha" },
-          },
-        }],
-      },
-      primitive: { topology: "triangle-list", cullMode: "none" },
-      depthStencil: { format: "depth24plus", depthWriteEnabled: true, depthCompare: "less" },
-    });
-    const edgeModule = device.createShaderModule({ code: edgeShader() });
-    edgePipeline = device.createRenderPipeline({
-      layout: "auto",
-      vertex: { module: edgeModule, entryPoint: "vs" },
-      fragment: { module: edgeModule, entryPoint: "fs", targets: [{ format }] },
-      primitive: { topology: "line-list" },
-      depthStencil: { format: "depth24plus", depthWriteEnabled: false, depthCompare: "less-equal" },
-    });
-  }
-
-  async function rebuildSolver() {
-    solver?.destroy();
-    solver = await WebGpuIb3DSolver.init(device, makeParams());
-    meshStats = `${solver.mesh.nb} vertices / ${solver.mesh.nt} triangles / ${solver.mesh.ne} edges`;
-    step = 0;
-    simTime = 0;
-  }
-
   function syncParams() {
-    solver?.setParams(makeParams());
+    if (!busy) solver?.setParams(makeParams());
   }
-
+  function endGesture() {
+    gesture++;
+    const id = pointerId;
+    pointerId = null;
+    if (id !== null && canvas.hasPointerCapture(id))
+      canvas.releasePointerCapture(id);
+    grabbed = -1;
+    activeDrag = null;
+    latestPointer = null;
+    previous = null;
+    cursor = null;
+    solver?.setGrab();
+    status = idleHint();
+  }
+  function idleHint() {
+    const interaction =
+      mode === "auto"
+        ? "pull shell / stir slice"
+        : mode === "fluid"
+          ? "stir slice"
+          : "pull shell";
+    return `Left-drag: orbit · right-drag: ${interaction} · scroll: zoom`;
+  }
+  function changeMode() {
+    endGesture();
+    if (mode === "fluid") view = "slice";
+  }
+  function sliceChanged() {
+    endGesture();
+  }
+  function viewChanged() {
+    endGesture();
+  }
+  function fieldChanged() {
+    fieldScale = field === "vorticity" ? 0.5 : 0.08;
+  }
   function resetSim() {
+    if (busy) return;
+    endGesture();
     solver?.reset(makeParams());
     step = 0;
     simTime = 0;
-    paused = false;
   }
-
-  async function changeShape() {
-    running = false;
-    await new Promise((r) => requestAnimationFrame(r));
-    await rebuildSolver();
-    simulate();
-  }
-
-  function ensureDepth() {
-    const dpr = window.devicePixelRatio || 1;
-    const width = Math.max(320, Math.floor(canvas.clientWidth * dpr));
-    const height = Math.max(280, Math.floor(canvas.clientHeight * dpr));
-    if (canvas.width === width && canvas.height === height && depthTexture) return;
-    canvas.width = width;
-    canvas.height = height;
-    depthTexture?.destroy();
-    depthTexture = device.createTexture({
-      size: [width, height],
-      format: "depth24plus",
-      usage: GPUTextureUsage.RENDER_ATTACHMENT,
-    });
-    depthView = depthTexture.createView();
-  }
-
-  function renderFrame() {
-    if (!solver) return;
-    ensureDepth();
-    const aspect = canvas.width / canvas.height;
-    const uniforms = new Float32Array(24);
-    uniforms.set(rotationMatrix(yaw, pitch), 0);
-    uniforms[16] = aspect;
-    uniforms[17] = 1.95;
-    uniforms[18] = volumeOpacity;
-    uniforms[19] = volumeThreshold;
-    uniforms[20] = volumeSamples;
-    uniforms[21] = volumeScale;
-    uniforms[22] = paramN;
-    uniforms[23] = volumeMode === "vorticity" ? 1 : 0;
-    device.queue.writeBuffer(uniformBuffer, 0, uniforms);
-    const view = context.getCurrentTexture().createView();
-    const encoder = device.createCommandEncoder();
-    const field = volumeMode === "off" ? null : solver.encodeField(encoder, volumeMode);
-    const pass = encoder.beginRenderPass({
-      colorAttachments: [{
-        view,
-        clearValue: { r: 0.965, g: 0.965, b: 0.95, a: 1 },
-        loadOp: "clear",
-        storeOp: "store",
-      }],
-      depthStencilAttachment: {
-        view: depthView!,
-        depthClearValue: 1,
-        depthLoadOp: "clear",
-        depthStoreOp: "store",
-      },
-    });
-    if (field) {
-      pass.setPipeline(volumePipeline);
-      pass.setBindGroup(0, bind(volumePipeline, [uniformBuffer, field]));
-      pass.draw(3);
-    }
-    pass.setPipeline(surfacePipeline);
-    pass.setBindGroup(0, bind(surfacePipeline, [uniformBuffer, solver.vertexBuffer, solver.triangleBuffer]));
-    pass.draw(solver.mesh.nt * 3);
-    pass.setPipeline(edgePipeline);
-    pass.setBindGroup(0, bind(edgePipeline, [uniformBuffer, solver.vertexBuffer, solver.edgeBuffer]));
-    pass.draw(solver.mesh.ne * 2);
-    pass.end();
-    device.queue.submit([encoder.finish()]);
-  }
-
-  function bind(pipeline: GPURenderPipeline, buffers: GPUBuffer[]) {
-    return device.createBindGroup({
-      layout: pipeline.getBindGroupLayout(0),
-      entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer } })),
-    });
-  }
-
-  async function simulate() {
-    running = true;
-    let last = performance.now();
-    let frames = 0;
-    while (running) {
-      renderFrame();
-      frames++;
-      if (!paused && solver) {
-        solver.stepBatch(stepsPerFrame);
-        step += stepsPerFrame;
-        simTime += stepsPerFrame * paramDt;
+  async function rebuild() {
+    endGesture();
+    busy = true;
+    const token = ++revision;
+    try {
+      const next = await WebGpuIb3DSolver.init(device, makeParams());
+      if (disposed || token !== revision) {
+        next.destroy();
+        return;
       }
-      const now = performance.now();
-      if (now - last > 1000) {
-        fps = Math.round((frames * 1000) / (now - last));
-        frames = 0;
-        last = now;
-      }
-      await new Promise((r) => requestAnimationFrame(r));
-    }
-  }
-
-  function onPointerDown(e: PointerEvent) {
-    pointerDown = true;
-    lastX = e.clientX;
-    lastY = e.clientY;
-    canvas.setPointerCapture(e.pointerId);
-  }
-
-  function onPointerMove(e: PointerEvent) {
-    if (!pointerDown) return;
-    const dx = e.clientX - lastX;
-    const dy = e.clientY - lastY;
-    lastX = e.clientX;
-    lastY = e.clientY;
-    if (dragMode === "stir" || e.shiftKey) {
-      stir(e, dx, dy);
-    } else {
-      yaw += dx * 0.006;
-      pitch = clamp(pitch + dy * 0.006, -1.25, 1.25);
-    }
-  }
-
-  function stir(e: PointerEvent, dx: number, dy: number) {
-    if (!solver || Math.hypot(dx, dy) < 0.5) return;
-    const rect = canvas.getBoundingClientRect();
-    const sx = ((e.clientX - rect.left) / rect.width - 0.5) * 2;
-    const sy = (0.5 - (e.clientY - rect.top) / rect.height) * 2;
-    const basis = cameraBasis(yaw, pitch);
-    const aspect = rect.width / rect.height;
-    const center = add([0.5, 0.5, 0.5], scale(add(scale(basis.right, sx * aspect), scale(basis.up, sy)), 0.28));
-    const force = add(scale(basis.right, dx * 0.55), scale(basis.up, -dy * 0.55));
-    solver.applyImpulse(wrapVec(center), force);
-  }
-
-  function onPointerUp(e: PointerEvent) {
-    pointerDown = false;
-    canvas.releasePointerCapture(e.pointerId);
-  }
-
-  onMount(() => {
-    startup();
-    return () => {
-      running = false;
       solver?.destroy();
-      depthTexture?.destroy();
+      solver = next;
+      step = 0;
+      simTime = 0;
+      meshStats = `${next.mesh.nb} vertices · ${next.mesh.nt} triangles`;
+      errorMsg = "";
+    } catch (e) {
+      errorMsg = String(e);
+      if (solver) {
+        paramN = solver.params.N;
+        paramRefine = solver.params.refinement;
+      }
+    } finally {
+      if (token === revision) busy = false;
+    }
+  }
+  function frame(now: number) {
+    if (disposed) return;
+    try {
+      if (solver && renderer && !busy) {
+        const encoder = device.createCommandEncoder();
+        if (!paused) {
+          solver.stepBatch(stepsPerFrame, encoder);
+          step += stepsPerFrame;
+          simTime += stepsPerFrame * paramDt;
+        }
+        if (view !== "off") solver.encodeField(encoder, field);
+        renderer.render(
+          encoder,
+          solver,
+          {
+            view,
+            component,
+            scale: fieldScale,
+            axis,
+            depth,
+            opacity,
+            surface,
+            arrows,
+          },
+          cursor,
+        );
+        device.queue.submit([encoder.finish()]);
+        frames++;
+      }
+      if (now - lastFrame > 1000) {
+        fps = Math.round((frames * 1000) / (now - lastFrame));
+        frames = 0;
+        lastFrame = now;
+      }
+    } catch (e) {
+      errorMsg = String(e);
+      paused = true;
+    }
+    frameId = requestAnimationFrame(frame);
+  }
+  function slicePlane() {
+    const n = new Vector3();
+    n.setComponent(axis, 1);
+    return new Plane(n, -depth);
+  }
+  function startFluid(clientX: number, clientY: number) {
+    if (!renderer) return;
+    view = "slice";
+    plane = slicePlane();
+    previous = renderer.planePoint(clientX, clientY, plane);
+    if (!previous || !inDomain(previous)) {
+      endGesture();
+      status =
+        "Start inside the highlighted slice · left-drag to change the view";
+      return;
+    }
+    activeDrag = "fluid";
+    cursor = previous.clone();
+    status = "Stirring fluid on the slice · release to let go";
+  }
+  // Capture before OrbitControls' native pointer listener: each drag has one owner.
+  async function onPointerDown(e: PointerEvent) {
+    if (busy || !solver || !renderer) {
+      e.stopImmediatePropagation();
+      return;
+    }
+    canvas.focus({ preventScroll: true });
+    const orbit =
+      (e.button === 0 && e.pointerType !== "touch") ||
+      e.button === 1 ||
+      e.altKey ||
+      (e.pointerType === "touch" && mode === "auto");
+    if (orbit) {
+      endGesture();
+      // OrbitControls swaps rotate/pan with Ctrl/Meta/Shift. Keep camera gestures
+      // rotating even when a modifier is held; panning remains disabled.
+      const rotate =
+        e.ctrlKey || e.metaKey || e.shiftKey ? MOUSE.PAN : MOUSE.ROTATE;
+      renderer.controls.mouseButtons.LEFT = rotate;
+      renderer.controls.mouseButtons.RIGHT = rotate;
+      return;
+    }
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    if (e.button !== (e.pointerType === "touch" ? 0 : 2) || !e.isPrimary)
+      return;
+    endGesture();
+    const token = gesture;
+    const automatic = mode === "auto";
+    pointerId = e.pointerId;
+    canvas.setPointerCapture(e.pointerId);
+    if (mode === "fluid" || e.shiftKey) {
+      startFluid(e.clientX, e.clientY);
+    } else {
+      activeDrag = "picking";
+      status = "Picking the shell…";
+      // Read only on a pick; the frame loop keeps the full fluid grid on the GPU.
+      const active = solver;
+      try {
+        const x = await active.readPositions();
+        if (token !== gesture || active !== solver || disposed) return;
+        const ray = renderer.ray(e.clientX, e.clientY).clone();
+        const triangles = active.mesh.triangles;
+        let nearest = Infinity,
+          hit: Vector3 | null = null,
+          vertex = -1,
+          offset = new Vector3();
+        const a = new Vector3(),
+          b = new Vector3(),
+          c = new Vector3(),
+          p = new Vector3();
+        for (let t = 0; t < triangles.length; t += 3) {
+          const ids = [triangles[t], triangles[t + 1], triangles[t + 2]];
+          a.fromArray(x, ids[0] * 4);
+          b.fromArray(x, ids[1] * 4);
+          c.fromArray(x, ids[2] * 4);
+          const center = a
+            .clone()
+            .add(b)
+            .add(c)
+            .multiplyScalar(1 / 3)
+            .floor();
+          for (let i = -1; i <= 1; i++)
+            for (let j = -1; j <= 1; j++)
+              for (let k = -1; k <= 1; k++) {
+                const delta = new Vector3(i, j, k).sub(center);
+                const av = a.clone().add(delta),
+                  bv = b.clone().add(delta),
+                  cv = c.clone().add(delta);
+                if (
+                  !ray.intersectTriangle(av, bv, cv, false, p) ||
+                  !inDomain(p)
+                )
+                  continue;
+                const distance = ray.origin.distanceToSquared(p);
+                if (distance >= nearest) continue;
+                nearest = distance;
+                hit = p.clone();
+                const points = [av, bv, cv];
+                let corner = 0;
+                for (let q = 1; q < 3; q++)
+                  if (
+                    points[q].distanceToSquared(p) <
+                    points[corner].distanceToSquared(p)
+                  )
+                    corner = q;
+                vertex = ids[corner];
+                offset = new Vector3().fromArray(x, vertex * 4).sub(p);
+              }
+        }
+        if (!hit) {
+          if (automatic) {
+            startFluid(e.clientX, e.clientY);
+            if (latestPointer)
+              moveInteraction(latestPointer.x, latestPointer.y);
+          } else {
+            endGesture();
+            status =
+              "No shell at that point — try a visible triangle or Shift-right-drag to stir";
+          }
+          return;
+        }
+        activeDrag = "body";
+        grabbed = vertex;
+        grabOffset = offset;
+        cursor = hit;
+        plane.setFromNormalAndCoplanarPoint(
+          renderer.camera.getWorldDirection(new Vector3()),
+          hit,
+        );
+        active.setGrab(
+          vertex,
+          hit.clone().add(offset).toArray() as [number, number, number],
+        );
+        status = `Pulling material point ${vertex} · release to let go`;
+        if (latestPointer) moveInteraction(latestPointer.x, latestPointer.y);
+      } catch (e) {
+        if (token === gesture) {
+          errorMsg = String(e);
+          endGesture();
+        }
+      }
+    }
+  }
+  function onPointerMove(e: PointerEvent) {
+    if (busy || !renderer || !solver) return;
+    if (pointerId === null) {
+      cursor =
+        (mode === "fluid" || e.shiftKey) && e.buttons === 0
+          ? renderer.planePoint(e.clientX, e.clientY, slicePlane())
+          : null;
+      if (cursor && !inDomain(cursor)) cursor = null;
+      return;
+    }
+    if (pointerId !== e.pointerId) return;
+    latestPointer = { x: e.clientX, y: e.clientY };
+    if (activeDrag !== "picking") moveInteraction(e.clientX, e.clientY);
+  }
+  function moveInteraction(clientX: number, clientY: number) {
+    if (!renderer || !solver) return;
+    const p = renderer.planePoint(clientX, clientY, plane);
+    if (!p) return;
+    if (activeDrag === "body" && grabbed >= 0) {
+      cursor = p;
+      solver.setGrab(
+        grabbed,
+        p.clone().add(grabOffset).toArray() as [number, number, number],
+      );
+    } else if (activeDrag === "fluid") {
+      if (!inDomain(p)) {
+        previous = null;
+        cursor = null;
+        return;
+      }
+      if (previous) {
+        const force = p.clone().sub(previous).multiplyScalar(180);
+        if (force.length() > 12) force.setLength(12);
+        solver.applyImpulse(
+          p.toArray() as [number, number, number],
+          force.toArray() as [number, number, number],
+        );
+      }
+      previous = p;
+      cursor = p;
+    }
+  }
+  function onPointerUp(e: PointerEvent) {
+    if (pointerId === e.pointerId) {
+      endGesture();
+    }
+  }
+  function onWheel(e: WheelEvent) {
+    endGesture();
+    if (!e.shiftKey || busy) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    view = "slice";
+    const delta =
+      e.deltaY *
+      (e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? canvas.clientHeight : 1);
+    depth =
+      Math.round(
+        Math.max(
+          0,
+          Math.min(1, depth + Math.max(-0.05, Math.min(0.05, delta * 0.001))),
+        ) * 100,
+      ) / 100;
+  }
+  function onKeyDown(e: KeyboardEvent) {
+    if (e.target !== canvas || e.ctrlKey || e.metaKey || e.altKey || e.repeat)
+      return;
+    if (e.code === "Space" && !busy) {
+      e.preventDefault();
+      endGesture();
+      paused = !paused;
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      endGesture();
+    } else if (e.key === "Home") {
+      e.preventDefault();
+      endGesture();
+      renderer?.controls.reset();
+    }
+  }
+  function onGpuError(event: GPUUncapturedErrorEvent) {
+    errorMsg = event.error.message;
+    paused = true;
+  }
+  onMount(() => {
+    canvas.addEventListener("pointerdown", onPointerDown, true);
+    canvas.addEventListener("wheel", onWheel, {
+      capture: true,
+      passive: false,
+    });
+    window.addEventListener("blur", endGesture);
+    void (async () => {
+      try {
+        await init("webgpu");
+        defaultDevice("webgpu");
+        if (disposed) return;
+        device = getWebGPUDevice();
+        device.addEventListener("uncapturederror", onGpuError);
+        renderer = new Ib3DRenderer(device, canvas);
+        await rebuild();
+        if (disposed) return;
+        changeMode();
+        lastFrame = performance.now();
+        frameId = requestAnimationFrame(frame);
+      } catch (e) {
+        errorMsg = String(e);
+        busy = false;
+      }
+    })();
+    return () => {
+      disposed = true;
+      revision++;
+      endGesture();
+      canvas.removeEventListener("pointerdown", onPointerDown, true);
+      canvas.removeEventListener("wheel", onWheel, true);
+      window.removeEventListener("blur", endGesture);
+      cancelAnimationFrame(frameId);
+      renderer?.destroy();
+      solver?.destroy();
+      device?.removeEventListener("uncapturederror", onGpuError);
     };
   });
-
-  async function startup() {
-    try {
-      await initWebGPU();
-      await rebuildSolver();
-      simulate();
-    } catch (e) {
-      console.error(e);
-      errorMsg = String(e);
-    }
-  }
-
-  function rotationMatrix(yaw: number, pitch: number) {
-    const cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
-    return [
-      cy, sy * sp, sy * cp, 0,
-      0, cp, -sp, 0,
-      -sy, cy * sp, cy * cp, 0,
-      0, 0, 0, 1,
-    ];
-  }
-
-  function cameraBasis(yaw: number, pitch: number) {
-    const m = rotationMatrix(yaw, pitch);
-    return {
-      right: [m[0], m[1], m[2]] as [number, number, number],
-      up: [m[4], m[5], m[6]] as [number, number, number],
-    };
-  }
-
-  function add(a: number[], b: number[]) {
-    return [a[0] + b[0], a[1] + b[1], a[2] + b[2]] as [number, number, number];
-  }
-  function scale(a: number[], s: number) {
-    return [a[0] * s, a[1] * s, a[2] * s] as [number, number, number];
-  }
-  function wrapVec(a: number[]) {
-    return a.map((x) => x - Math.floor(x)) as [number, number, number];
-  }
-  function clamp(x: number, lo: number, hi: number) {
-    return Math.max(lo, Math.min(hi, x));
-  }
-
-  function surfaceShader() {
-    return /* wgsl */ `
-const STRUCTURE_ALPHA: f32 = 0.58;
-struct Uniforms { m: mat4x4f, params0: vec4f, params1: vec4f }
-@group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var<storage, read> x: array<vec4f>;
-@group(0) @binding(2) var<storage, read> tri: array<u32>;
-struct Out { @builtin(position) pos: vec4f, @location(0) color: vec3f }
-fn project(p: vec3f) -> vec4f {
-  let q = (u.m * vec4f(p - vec3f(0.5), 1.0)).xyz;
-  return vec4f(q.x * u.params0.y / u.params0.x, q.y * u.params0.y, 0.45 - q.z * 0.5, 1.0);
-}
-@vertex fn vs(@builtin(vertex_index) vi: u32) -> Out {
-  let t = vi / 3u;
-  let corner = vi % 3u;
-  let ia = tri[t * 3u];
-  let ib = tri[t * 3u + 1u];
-  let ic = tri[t * 3u + 2u];
-  let idx = select(select(ia, ib, corner == 1u), ic, corner == 2u);
-  let a = x[ia].xyz - vec3f(0.5);
-  let b = x[ib].xyz - vec3f(0.5);
-  let c = x[ic].xyz - vec3f(0.5);
-  let n = normalize((u.m * vec4f(normalize(cross(b - a, c - a)), 0.0)).xyz);
-  let light = normalize(vec3f(0.25, 0.45, 0.85));
-  let shade = 0.38 + 0.62 * max(dot(n, light), 0.0);
-  var out: Out;
-  out.pos = project(x[idx].xyz);
-  out.color = mix(vec3f(0.08, 0.37, 0.62), vec3f(0.0, 0.72, 0.68), shade);
-  return out;
-}
-@fragment fn fs(in: Out) -> @location(0) vec4f {
-  return vec4f(in.color, STRUCTURE_ALPHA);
-}`;
-  }
-
-  function edgeShader() {
-    return /* wgsl */ `
-struct Uniforms { m: mat4x4f, params0: vec4f, params1: vec4f }
-@group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var<storage, read> x: array<vec4f>;
-@group(0) @binding(2) var<storage, read> edge: array<u32>;
-fn project(p: vec3f) -> vec4f {
-  let q = (u.m * vec4f(p - vec3f(0.5), 1.0)).xyz;
-  return vec4f(q.x * u.params0.y / u.params0.x, q.y * u.params0.y, 0.44 - q.z * 0.5, 1.0);
-}
-@vertex fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
-  return project(x[edge[vi]].xyz);
-}
-@fragment fn fs() -> @location(0) vec4f {
-  return vec4f(0.02, 0.08, 0.12, 0.75);
-}`;
-  }
-
-  function volumeShader() {
-    return /* wgsl */ `
-struct Uniforms { m: mat4x4f, params0: vec4f, params1: vec4f }
-@group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var<storage, read> field: array<f32>;
-struct Out { @builtin(position) pos: vec4f, @location(0) ndc: vec2f }
-fn invRot(v: vec3f) -> vec3f {
-  return vec3f(
-    u.m[0].x * v.x + u.m[0].y * v.y + u.m[0].z * v.z,
-    u.m[1].x * v.x + u.m[1].y * v.y + u.m[1].z * v.z,
-    u.m[2].x * v.x + u.m[2].y * v.y + u.m[2].z * v.z,
-  );
-}
-fn boxHit(ro: vec3f, rd: vec3f) -> vec2f {
-  let inv = 1.0 / rd;
-  let lo = (vec3f(0.0) - ro) * inv;
-  let hi = (vec3f(1.0) - ro) * inv;
-  let near = min(lo, hi);
-  let far = max(lo, hi);
-  return vec2f(max(max(near.x, near.y), near.z), min(min(far.x, far.y), far.z));
-}
-fn idx(i: u32, j: u32, k: u32, n: u32) -> u32 {
-  return (i * n + j) * n + k;
-}
-fn texel(i: u32, j: u32, k: u32, n: u32) -> f32 {
-  return field[idx(min(i, n - 1u), min(j, n - 1u), min(k, n - 1u), n)];
-}
-fn sampleField(p: vec3f, n: u32) -> f32 {
-  let q = clamp(p, vec3f(0.0), vec3f(0.9999)) * f32(n);
-  let b = vec3u(floor(q));
-  let f = fract(q);
-  let i1 = min(b.x + 1u, n - 1u);
-  let j1 = min(b.y + 1u, n - 1u);
-  let k1 = min(b.z + 1u, n - 1u);
-  let c00 = mix(texel(b.x, b.y, b.z, n), texel(i1, b.y, b.z, n), f.x);
-  let c10 = mix(texel(b.x, j1, b.z, n), texel(i1, j1, b.z, n), f.x);
-  let c01 = mix(texel(b.x, b.y, k1, n), texel(i1, b.y, k1, n), f.x);
-  let c11 = mix(texel(b.x, j1, k1, n), texel(i1, j1, k1, n), f.x);
-  return mix(mix(c00, c10, f.y), mix(c01, c11, f.y), f.z);
-}
-@vertex fn vs(@builtin(vertex_index) vi: u32) -> Out {
-  let p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0))[vi];
-  var out: Out;
-  out.pos = vec4f(p, 0.0, 1.0);
-  out.ndc = p;
-  return out;
-}
-@fragment fn fs(in: Out) -> @location(0) vec4f {
-  let aspect = u.params0.x;
-  let scale = u.params0.y;
-  let opacity = u.params0.z;
-  let threshold = u.params0.w;
-  let samples = max(u32(u.params1.x + 0.5), 16u);
-  let fieldScale = max(u.params1.y, 0.0001);
-  let n = max(u32(u.params1.z + 0.5), 2u);
-  let isVorticity = u.params1.w > 0.5;
-  let xy = vec2f(in.ndc.x * aspect / scale, in.ndc.y / scale);
-  let ro = vec3f(0.5) + invRot(vec3f(xy, -1.05));
-  let rd = normalize(invRot(vec3f(0.0, 0.0, 1.0)));
-  let hit = boxHit(ro, rd);
-  if (hit.x > hit.y || hit.y < 0.0) { discard; }
-  let t0 = max(hit.x, 0.0);
-  let dt = (hit.y - t0) / f32(samples);
-  var acc = vec4f(0.0);
-  for (var s = 0u; s < 192u; s++) {
-    if (s >= samples || acc.a > 0.96) { break; }
-    let p = ro + rd * (t0 + (f32(s) + 0.5) * dt);
-    let v = clamp(sampleField(p, n) / fieldScale, 0.0, 1.25);
-    let a = smoothstep(threshold, 1.0, v) * opacity;
-    let cold = select(vec3f(0.04, 0.23, 0.65), vec3f(0.23, 0.06, 0.38), isVorticity);
-    let hot = select(vec3f(0.0, 0.82, 0.82), vec3f(1.0, 0.48, 0.08), isVorticity);
-    let color = mix(cold, hot, min(v, 1.0));
-    acc = vec4f(acc.rgb + (1.0 - acc.a) * a * color, acc.a + (1.0 - acc.a) * a);
-  }
-  return acc;
-}`;
-  }
 </script>
 
-<svelte:head>
-  <title>Interactive 3D Immersed Boundary Method</title>
-</svelte:head>
-
-<main class="ib3d">
-  <nav class="breadcrumb">
-    <a href="../">&larr; 2D IB simulation</a>
+<svelte:head><title>Interactive 3D Immersed Boundary Method</title></svelte:head
+>
+<main>
+  <nav>
+    <a href="https://guanhuasun.github.io/">← guanhuasun.github.io</a><span>PERIODIC DOMAIN · [0, 1]³</span>
   </nav>
-
-  {#if errorMsg}
-    <pre class="error-msg">{errorMsg}</pre>
-  {/if}
-
-  <header class="page-header">
-    <h1><span>Interactive</span> 3D Immersed Boundary Method</h1>
+  <header>
+    <h1><em>Interactive</em> 3D Immersed Boundary Method</h1>
     <p>
-      Triangulated elastic sphere coupled to a periodic 3D velocity grid with
-      Peskin 4-point interpolation and spreading.
+      An elastic shell in an incompressible fluid. Explore the flow, move a
+      slice, or pull the surface.
     </p>
+    <SimulationNav current="3d" />
   </header>
-
-  <section class="stage">
+  {#if errorMsg}<pre class="error" role="alert">{errorMsg}</pre>{/if}
+  <div class="toolbar">
+    <div class="modes" aria-label="Interaction mode">
+      {#each [["auto", "Auto"], ["fluid", "Stir fluid"], ["body", "Pull body"]] as [value, label]}
+        <button
+          class:active={mode === value}
+          aria-pressed={mode === value}
+          disabled={busy}
+          onclick={() => {
+            mode = value as typeof mode;
+            changeMode();
+          }}>{label}</button
+        >
+      {/each}
+    </div>
+    <div class="actions">
+      <button
+        disabled={busy}
+        onclick={() => {
+          endGesture();
+          paused = !paused;
+        }}>{paused ? "Play" : "Pause"}</button
+      ><button disabled={busy} onclick={resetSim}>Reset</button><button
+        onclick={() => renderer?.controls.reset()}>Home view</button
+      >
+    </div>
+  </div>
+  <section class="stage" aria-label="3D immersed boundary simulation">
     <canvas
       bind:this={canvas}
-      onpointerdown={onPointerDown}
+      tabindex="0"
+      aria-label="Interactive 3D fluid and elastic shell"
+      aria-describedby="interaction-help"
+      onkeydown={onKeyDown}
       onpointermove={onPointerMove}
       onpointerup={onPointerUp}
       onpointercancel={onPointerUp}
+      onlostpointercapture={onPointerUp}
+      onpointerleave={() => {
+        if (pointerId === null) cursor = null;
+      }}
     ></canvas>
     <div class="hud">
-      <b>t = {simTime.toFixed(2)} s</b>
-      <span>step {step} / {fps} FPS</span>
-      <span>{meshStats}</span>
+      <b>t = {simTime.toFixed(3)}</b><span>{step} steps · {fps} FPS</span><span
+        >{paramN}³ · {meshStats}</span
+      >
+    </div>
+    <div class="legend">
+      <b
+        >{field === "vorticity" ? "Vorticity ω" : "Velocity u"}{component < 3
+          ? ` · ${axes[component]}`
+          : " · magnitude"}</b
+      >
+      <div class:signed={component < 3} class="ramp"></div>
+      <div class="ticks">
+        <span>{component < 3 ? `−${fieldScale}` : "0"}</span
+        >{#if component < 3}<span>0</span>{/if}<span>{fieldScale}</span>
+      </div>
+      <small
+        >{arrows && view === "slice"
+          ? "Arrows show the full 3D vector"
+          : "Colors saturate at the displayed range"}</small
+      >
+    </div>
+    <div class="axis-key">
+      <span class="x">x</span><span class="y">y</span><span class="z">z</span>
+    </div>
+    {#if busy}<div class="loading">Preparing grid and shell…</div>{/if}
+    <div class="status" aria-live="polite">
+      {status}{paused ? " · PAUSED" : ""}
     </div>
   </section>
-
-  <section class="controls">
-    <label>
-      <span>Drag</span>
-      <select bind:value={dragMode}>
-        <option value="rotate">Rotate</option>
-        <option value="stir">Stir</option>
-      </select>
-    </label>
-    <label>
-      <span>Grid</span>
-      <select bind:value={paramN} onchange={() => void changeShape()}>
-        <option value={16}>16^3</option>
-        <option value={32}>32^3</option>
-      </select>
-    </label>
-    <label>
-      <span>Mesh</span>
-      <select bind:value={paramRefine} onchange={() => void changeShape()}>
-        <option value={1}>80 tris</option>
-        <option value={2}>320 tris</option>
-        <option value={3}>1280 tris</option>
-      </select>
-    </label>
-    <label>
-      <span>K</span>
-      <input type="range" min="0.001" max="0.04" step="0.001" bind:value={paramK} oninput={syncParams} />
-      <output>{paramK.toFixed(3)}</output>
-    </label>
-    <label>
-      <span>mu</span>
-      <input type="range" min="0.002" max="0.04" step="0.001" bind:value={paramMu} oninput={syncParams} />
-      <output>{paramMu.toFixed(3)}</output>
-    </label>
-    <label>
-      <span>dt</span>
-      <input type="range" min="0.0005" max="0.004" step="0.0005" bind:value={paramDt} oninput={syncParams} />
-      <output>{paramDt.toFixed(3)}</output>
-    </label>
-    <label>
-      <span>Field</span>
-      <select bind:value={volumeMode}>
-        <option value="velocity">|u|</option>
-        <option value="vorticity">|curl u|</option>
-        <option value="off">Off</option>
-      </select>
-    </label>
-    <label>
-      <span>Alpha</span>
-      <input type="range" min="0.01" max="0.12" step="0.005" bind:value={volumeOpacity} />
-      <output>{volumeOpacity.toFixed(3)}</output>
-    </label>
-    <label>
-      <span>Cutoff</span>
-      <input type="range" min="0.01" max="0.6" step="0.01" bind:value={volumeThreshold} />
-      <output>{volumeThreshold.toFixed(2)}</output>
-    </label>
-    <label>
-      <span>Scale</span>
-      <input type="range" min="0.02" max="0.6" step="0.01" bind:value={volumeScale} />
-      <output>{volumeScale.toFixed(2)}</output>
-    </label>
-    <label>
-      <span>Samples</span>
-      <input type="range" min="32" max="160" step="16" bind:value={volumeSamples} />
-      <output>{volumeSamples}</output>
-    </label>
-    <label>
-      <span>Steps</span>
-      <input type="range" min="1" max="6" step="1" bind:value={stepsPerFrame} />
-      <output>{stepsPerFrame}</output>
-    </label>
-    <button onclick={resetSim}>Reset</button>
-    <button class="primary" onclick={() => (paused = !paused)}>{paused ? "Play" : "Pause"}</button>
-  </section>
-
-  <p class="note">
-    Shift-drag stirs from rotate mode. The 3D path uses edge-spring forces, 3D
-    Peskin coupling, a spectral incompressible fluid solve, and direct WebGPU
-    raymarching for the velocity or vorticity volume field.
+  <div class="panels">
+    <fieldset>
+      <legend>Flow display</legend>
+      <label
+        >Field<select
+          aria-label="Field"
+          bind:value={field}
+          onchange={fieldChanged}
+          ><option value="vorticity">Vorticity ω</option><option
+            value="velocity">Velocity u</option
+          ></select
+        ></label
+      >
+      <label
+        >View<select aria-label="View" bind:value={view} onchange={viewChanged}
+          ><option value="slice">Slice</option><option value="volume"
+            >Volume</option
+          ><option value="off">Shell only</option></select
+        ></label
+      >
+      <label
+        >Color<select aria-label="Color" bind:value={component}
+          ><option value={0}>x component</option><option value={1}
+            >y component</option
+          ><option value={2}>z component</option><option value={3}
+            >Magnitude</option
+          ></select
+        ></label
+      >
+      <label
+        >Color range<input
+          aria-label="Color range"
+          type="number"
+          min="0.001"
+          max="100"
+          step="0.01"
+          bind:value={fieldScale}
+        /></label
+      >
+      <label class="check"
+        ><input type="checkbox" bind:checked={arrows} />Vector arrows on slice</label
+      >
+      <label
+        >Field opacity <output>{opacity.toFixed(2)}</output><input
+          type="range"
+          min="0.05"
+          max="1"
+          step="0.05"
+          bind:value={opacity}
+        /></label
+      >
+      <label
+        >Shell opacity <output>{surface.toFixed(2)}</output><input
+          type="range"
+          min="0"
+          max="0.8"
+          step="0.02"
+          bind:value={surface}
+        /></label
+      >
+    </fieldset>
+    <fieldset>
+      <legend>Slice & interaction</legend>
+      <label
+        >Slice plane<select
+          aria-label="Slice plane"
+          bind:value={axis}
+          onchange={sliceChanged}
+          ><option value={0}>YZ · normal x</option><option value={1}
+            >XZ · normal y</option
+          ><option value={2}>XY · normal z</option></select
+        ></label
+      >
+      <label
+        >Depth {axes[axis]} <output>{depth.toFixed(2)}</output><input
+          aria-label="Slice depth"
+          type="range"
+          min="0"
+          max="1"
+          step="0.01"
+          bind:value={depth}
+          oninput={sliceChanged}
+        /></label
+      >
+      <p id="interaction-help">
+        Left-drag to orbit. Right-drag the shell to pull it, or right-drag
+        elsewhere to stir the slice. Shift-right-drag always stirs, including
+        through the shell. Scroll or middle-drag zooms. Shift-scroll moves the
+        slice.
+      </p>
+      <p>
+        Pull body picks a material point and applies a spring force in a plane
+        facing you. Hold and move while playing; release to let go.
+      </p>
+      <p>
+        With the canvas focused: Space plays/pauses, Escape releases the body,
+        Home restores the camera. Buttons choose the right-drag target;
+        left-drag and scroll work in every mode. On touch screens, Auto rotates
+        with one finger and zooms with a pinch; use the buttons to stir or pull.
+      </p>
+    </fieldset>
+    <fieldset disabled={busy}>
+      <legend>Simulation</legend>
+      <label
+        >Grid<select
+          aria-label="Grid"
+          bind:value={paramN}
+          onchange={() => void rebuild()}
+          ><option value={32}>32³</option><option value={64}>64³</option
+          ></select
+        ></label
+      >
+      <label
+        >Surface mesh<select
+          aria-label="Surface mesh"
+          bind:value={paramRefine}
+          onchange={() => void rebuild()}
+          ><option value={1}>80 triangles</option><option value={2}
+            >320 triangles</option
+          ><option value={3}>1280 triangles</option></select
+        ></label
+      >
+      <label
+        >Stiffness K <output>{paramK.toFixed(3)}</output><input
+          type="range"
+          min="0.001"
+          max="0.04"
+          step="0.001"
+          bind:value={paramK}
+          oninput={syncParams}
+        /></label
+      >
+      <label
+        >Viscosity μ <output>{paramMu.toFixed(3)}</output><input
+          type="range"
+          min="0.002"
+          max="0.04"
+          step="0.001"
+          bind:value={paramMu}
+          oninput={syncParams}
+        /></label
+      >
+      <label
+        >Time step Δt <output>{paramDt.toFixed(4)}</output><input
+          type="range"
+          min="0.0005"
+          max="0.004"
+          step="0.0005"
+          bind:value={paramDt}
+          oninput={syncParams}
+        /></label
+      >
+      <label
+        >Steps per frame <output>{stepsPerFrame}</output><input
+          type="range"
+          min="1"
+          max="6"
+          step="1"
+          bind:value={stepsPerFrame}
+        /></label
+      >
+    </fieldset>
+  </div>
+  <p class="footnote">
+    The slice colors show a signed component or magnitude; arrows retain
+    direction. The shell uses edge springs relaxed at the initial sphere, with
+    midpoint coupling and the same two-stage fluid scheme as the 2D simulation.
   </p>
 </main>
 
 <style>
-  .ib3d {
-    max-width: 1080px;
-    margin: 0 auto;
+  main {
+    max-width: 1200px;
+    margin: auto;
     padding: 24px;
     color: var(--color-text);
     font-family: var(--font-sans);
   }
-  .breadcrumb {
-    font-family: var(--font-mono);
-    font-size: 12px;
-    margin-bottom: 18px;
-  }
-  .breadcrumb a {
+  nav {
+    display: flex;
+    justify-content: space-between;
+    font: 11px var(--font-mono);
     color: var(--color-text-meta);
+    margin-bottom: 22px;
   }
-  .error-msg {
-    padding: 12px;
-    border: 1px solid var(--color-warn);
-    background: var(--color-danger-bg);
-    color: var(--color-warn);
-    white-space: pre-wrap;
-  }
-  .page-header {
-    margin-bottom: 14px;
+  a {
+    color: inherit;
   }
   h1 {
-    font-family: var(--font-serif);
-    font-size: 24px;
-    line-height: 1.2;
-    margin: 0 0 6px;
+    font: 28px var(--font-serif);
+    margin: 0 0 8px;
   }
-  h1 span {
+  h1 em {
     color: var(--color-link);
-    font-style: italic;
-    font-weight: 700;
   }
-  .page-header p,
-  .note {
+  header p {
     margin: 0;
-    max-width: 760px;
     color: var(--color-text-meta);
-    line-height: 1.5;
+    font-size: 14px;
+  }
+  .toolbar,
+  .modes,
+  .actions {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  .toolbar {
+    justify-content: space-between;
+    margin: 22px 0 10px;
+    flex-wrap: wrap;
+  }
+  button,
+  select,
+  input {
+    font: 12px var(--font-mono);
+  }
+  button,
+  select,
+  input[type="number"] {
+    border: 1px solid var(--color-border);
+    background: var(--color-bg);
+    color: var(--color-text);
+    padding: 9px 12px;
+    border-radius: 3px;
+  }
+  button {
+    cursor: pointer;
+  }
+  button.active {
+    background: var(--color-text);
+    color: var(--color-bg);
+  }
+  button:disabled {
+    opacity: 0.45;
+    cursor: wait;
   }
   .stage {
     position: relative;
+    height: min(66vh, 650px);
+    min-height: 400px;
     border: 1px solid var(--color-border);
-    background: #f6f6f2;
-    margin: 18px 0 14px;
-    height: min(68vh, 680px);
-    min-height: 420px;
+    background: #f6f7f3;
   }
   canvas {
     width: 100%;
@@ -630,58 +781,159 @@ fn sampleField(p: vec3f, n: u32) -> f32 {
     touch-action: none;
     cursor: grab;
   }
-  canvas:active {
-    cursor: grabbing;
+  canvas:focus-visible {
+    outline: 2px solid var(--color-link);
+    outline-offset: -2px;
+  }
+  .hud,
+  .legend,
+  .status,
+  .axis-key {
+    position: absolute;
+    pointer-events: none;
+    font: 11px var(--font-mono);
+    background: rgb(250 251 248 / 90%);
+    padding: 9px 12px;
+    color: #44504e;
   }
   .hud {
-    position: absolute;
-    left: 14px;
-    top: 14px;
+    left: 12px;
+    top: 12px;
     display: flex;
-    gap: 10px;
+    gap: 14px;
     flex-wrap: wrap;
-    align-items: center;
-    max-width: calc(100% - 28px);
-    padding: 8px 10px;
-    background: rgb(255 255 255 / 82%);
-    border: 1px solid var(--color-border);
-    font-family: var(--font-mono);
-    font-size: 12px;
+    max-width: calc(100% - 48px);
   }
-  .controls {
+  .legend {
+    left: 12px;
+    bottom: 50px;
+    width: 190px;
+  }
+  .legend b {
+    font-weight: 500;
+  }
+  .ramp {
+    height: 8px;
+    background: linear-gradient(90deg, #eff7ed, #058082);
+    margin-top: 10px;
+  }
+  .ramp.signed {
+    background: linear-gradient(90deg, #1f5cc2, #f7f7ed, #d4331a);
+  }
+  .ticks {
+    display: flex;
+    justify-content: space-between;
+    margin: 5px 0;
+  }
+  .legend small {
+    font: 10px var(--font-mono);
+  }
+  .status {
+    bottom: 0;
+    left: 0;
+    right: 0;
+    border-top: 1px solid #d9e0d9;
+    padding: 10px 14px;
+  }
+  .axis-key {
+    right: 12px;
+    bottom: 48px;
+    display: flex;
+    gap: 12px;
+  }
+  .x {
+    color: #cc3829;
+  }
+  .y {
+    color: #268c45;
+  }
+  .z {
+    color: #2959cc;
+  }
+  .loading {
+    position: absolute;
+    inset: 0;
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
-    gap: 10px;
-    align-items: end;
-    margin-bottom: 12px;
+    place-items: center;
+    background: #f6f7f3c9;
+  }
+  .panels {
+    display: grid;
+    grid-template-columns: 1.1fr 1fr 1fr;
+    gap: 16px;
+    margin-top: 20px;
+  }
+  fieldset {
+    min-width: 0;
+    border: 1px solid var(--color-border);
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  legend {
+    font: 12px var(--font-mono);
+    padding: 0 7px;
   }
   label {
     display: grid;
-    gap: 5px;
-    font-family: var(--font-mono);
-    font-size: 12px;
+    grid-template-columns: 1fr auto;
+    gap: 6px;
+    font: 12px var(--font-mono);
     color: var(--color-text-meta);
   }
-  select,
-  input,
-  button {
-    min-height: 34px;
-    font: inherit;
+  label select,
+  label input[type="range"],
+  label input[type="number"] {
+    grid-column: 1/-1;
+    width: 100%;
+    box-sizing: border-box;
+  }
+  label.check {
+    display: flex;
+    align-items: center;
   }
   output {
     color: var(--color-text);
   }
-  button {
-    border: 1px solid var(--color-text);
-    background: transparent;
-    color: var(--color-text);
-    cursor: pointer;
+  fieldset p,
+  .footnote {
+    font-size: 12px;
+    line-height: 1.65;
+    color: var(--color-text-meta);
+    margin: 0;
   }
-  button.primary {
-    background: var(--color-text);
-    color: var(--color-bg);
+  .footnote {
+    margin-top: 16px;
+    max-width: 950px;
   }
-  .note {
-    font-size: 13px;
+  .error {
+    white-space: pre-wrap;
+    background: #ffe5dc;
+    padding: 16px;
+    color: #8b2e17;
+  }
+  @media (max-width: 760px) {
+    main {
+      padding: 14px;
+    }
+    .panels {
+      grid-template-columns: 1fr;
+    }
+    h1 {
+      font-size: 23px;
+    }
+    nav span {
+      display: none;
+    }
+    .stage {
+      min-height: 440px;
+    }
+    .hud {
+      gap: 6px;
+    }
+    .actions {
+      margin-left: auto;
+    }
   }
 </style>

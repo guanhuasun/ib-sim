@@ -3,7 +3,6 @@ export type IB3DParams = {
   dt: number;
   K: number;
   mu: number;
-  damping: number;
   refinement: number;
   radius: number;
 };
@@ -16,6 +15,7 @@ type Mesh = {
   edges: Uint32Array;
   starts: Uint32Array;
   neighbors: Uint32Array;
+  restLengths: Float32Array;
   nb: number;
   nt: number;
   ne: number;
@@ -39,6 +39,7 @@ type Buffers = {
   edges: GPUBuffer;
   starts: GPUBuffer;
   neighbors: GPUBuffer;
+  restLengths: GPUBuffer;
   field: GPUBuffer;
 };
 
@@ -62,6 +63,7 @@ type PipelineKey =
 const PARAM_BYTES = 48;
 const IMPULSE_BYTES = 32;
 const WORKGROUP = 128;
+type CachedBinding = { buffers: GPUBuffer[]; group: GPUBindGroup };
 
 export class WebGpuIb3DSolver {
   readonly mesh: Mesh;
@@ -70,7 +72,10 @@ export class WebGpuIb3DSolver {
   #paramBuffer: GPUBuffer;
   #impulseBuffer: GPUBuffer;
   #fieldModeBuffer: GPUBuffer;
+  #grabBuffer: GPUBuffer;
   #pipelines = new Map<PipelineKey, GPUComputePipeline>();
+  #bindings = new Map<PipelineKey, CachedBinding[]>();
+  #fieldMode: IB3DFieldMode | undefined;
   #destroyed = false;
 
   private constructor(
@@ -89,11 +94,18 @@ export class WebGpuIb3DSolver {
     this.#paramBuffer = paramBuffer;
     this.#impulseBuffer = impulseBuffer;
     this.#fieldModeBuffer = fieldModeBuffer;
+    this.#grabBuffer = device.createBuffer({
+      size: 32,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
     this.#pipelines = pipelines;
     this.#writeParams();
   }
 
   static async init(device: GPUDevice, params: IB3DParams) {
+    validateParams(params);
+    // Compile before allocating simulation state so shader failures do not leak buffers.
+    const pipelines = await createPipelines(device, params);
     const mesh = createSphereMesh(params.refinement, params.radius);
     const buffers = createBuffers(device, params, mesh);
     const paramBuffer = device.createBuffer({
@@ -108,10 +120,6 @@ export class WebGpuIb3DSolver {
       size: 4,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
-    if ((params.N & (params.N - 1)) !== 0) {
-      throw new Error(`IB3D spectral solver requires a power-of-two grid, got N=${params.N}`);
-    }
-    const pipelines = await createPipelines(device, params);
     return new WebGpuIb3DSolver(
       device,
       params,
@@ -126,6 +134,48 @@ export class WebGpuIb3DSolver {
 
   get vertexBuffer() {
     return this.#buffers.X;
+  }
+
+  get velocityBuffer() {
+    return this.#buffers.u;
+  }
+
+  /** A temporary tether force on one material point, spread through the usual IB coupling. */
+  setGrab(
+    vertex = -1,
+    target: [number, number, number] = [0, 0, 0],
+    strength = 0.02,
+  ) {
+    this.#assertAlive();
+    const data = new Float32Array([
+      target[0],
+      target[1],
+      target[2],
+      strength,
+      vertex,
+      0,
+      0,
+      0,
+    ]);
+    this.device.queue.writeBuffer(this.#grabBuffer, 0, data);
+  }
+
+  async readPositions() {
+    this.#assertAlive();
+    const source = this.vertexBuffer;
+    const staging = this.device.createBuffer({
+      size: source.size,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+    try {
+      const encoder = this.device.createCommandEncoder();
+      encoder.copyBufferToBuffer(source, 0, staging, 0, source.size);
+      this.device.queue.submit([encoder.finish()]);
+      await staging.mapAsync(GPUMapMode.READ);
+      return new Float32Array(staging.getMappedRange()).slice();
+    } finally {
+      staging.destroy();
+    }
   }
 
   get triangleBuffer() {
@@ -146,6 +196,7 @@ export class WebGpuIb3DSolver {
 
   reset(params = this.#params) {
     this.#assertAlive();
+    validateParams(params);
     if (
       params.N !== this.#params.N ||
       params.refinement !== this.#params.refinement ||
@@ -154,28 +205,62 @@ export class WebGpuIb3DSolver {
       throw new Error("IB3D reset cannot resize grid or mesh");
     }
     this.#params = { ...params };
+    this.setGrab();
     this.#writeParams();
-    this.device.queue.writeBuffer(this.#buffers.u, 0, gpuData(initialVelocity(params)));
-    this.device.queue.writeBuffer(this.#buffers.X, 0, gpuData(this.mesh.positions));
+    this.device.queue.writeBuffer(
+      this.#buffers.u,
+      0,
+      gpuData(initialVelocity(params)),
+    );
+    this.device.queue.writeBuffer(
+      this.#buffers.X,
+      0,
+      gpuData(this.mesh.positions),
+    );
   }
 
   setParams(params: IB3DParams) {
     this.#assertAlive();
+    validateParams(params);
+    if (
+      params.N !== this.#params.N ||
+      params.refinement !== this.#params.refinement ||
+      params.radius !== this.#params.radius
+    ) {
+      throw new Error("Rebuild the 3D solver to change its grid or mesh");
+    }
     this.#params = { ...params };
     this.#writeParams();
   }
 
-  applyImpulse(center: [number, number, number], force: [number, number, number]) {
+  applyImpulse(
+    center: [number, number, number],
+    force: [number, number, number],
+  ) {
     this.#assertAlive();
     this.device.queue.writeBuffer(
       this.#impulseBuffer,
       0,
-      gpuData(new Float32Array([center[0], center[1], center[2], 0.08, force[0], force[1], force[2], 0])),
+      gpuData(
+        new Float32Array([
+          center[0],
+          center[1],
+          center[2],
+          0.08,
+          force[0],
+          force[1],
+          force[2],
+          0,
+        ]),
+      ),
     );
     const encoder = this.device.createCommandEncoder();
-    this.#dispatch(encoder, "impulse", [this.#paramBuffer, this.#impulseBuffer, this.#buffers.u], [
-      Math.ceil((this.#params.N ** 3) / WORKGROUP),
-    ]);
+    this.#dispatch(
+      encoder,
+      "impulse",
+      [this.#paramBuffer, this.#impulseBuffer, this.#buffers.u],
+      [Math.ceil(this.#params.N ** 3 / WORKGROUP)],
+    );
     this.device.queue.submit([encoder.finish()]);
   }
 
@@ -189,29 +274,45 @@ export class WebGpuIb3DSolver {
 
   encodeField(encoder: GPUCommandEncoder, mode: IB3DFieldMode) {
     this.#assertAlive();
-    this.device.queue.writeBuffer(
-      this.#fieldModeBuffer,
-      0,
-      gpuData(new Uint32Array([mode === "vorticity" ? 1 : 0])),
-    );
+    if (mode !== this.#fieldMode) {
+      this.device.queue.writeBuffer(
+        this.#fieldModeBuffer,
+        0,
+        gpuData(new Uint32Array([mode === "vorticity" ? 1 : 0])),
+      );
+      this.#fieldMode = mode;
+    }
     this.#dispatch(
       encoder,
       "field",
-      [this.#paramBuffer, this.#fieldModeBuffer, this.#buffers.u, this.#buffers.field],
-      [Math.ceil((this.#params.N ** 3) / WORKGROUP)],
+      [
+        this.#paramBuffer,
+        this.#fieldModeBuffer,
+        this.#buffers.u,
+        this.#buffers.field,
+      ],
+      [Math.ceil(this.#params.N ** 3 / WORKGROUP)],
     );
     return this.#buffers.field;
   }
 
-  stepBatch(count = 1) {
+  stepBatch(count = 1, externalEncoder?: GPUCommandEncoder) {
     this.#assertAlive();
-    const encoder = this.device.createCommandEncoder();
+    const encoder = externalEncoder ?? this.device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
     for (let i = 0; i < count; i++) {
-      this.#encodeStep(encoder);
-      [this.#buffers.u, this.#buffers.uNext] = [this.#buffers.uNext, this.#buffers.u];
-      [this.#buffers.X, this.#buffers.XNext] = [this.#buffers.XNext, this.#buffers.X];
+      this.#encodeStep(pass);
+      [this.#buffers.u, this.#buffers.uNext] = [
+        this.#buffers.uNext,
+        this.#buffers.u,
+      ];
+      [this.#buffers.X, this.#buffers.XNext] = [
+        this.#buffers.XNext,
+        this.#buffers.X,
+      ];
     }
-    this.device.queue.submit([encoder.finish()]);
+    pass.end();
+    if (!externalEncoder) this.device.queue.submit([encoder.finish()]);
   }
 
   destroy() {
@@ -221,51 +322,200 @@ export class WebGpuIb3DSolver {
     this.#paramBuffer.destroy();
     this.#impulseBuffer.destroy();
     this.#fieldModeBuffer.destroy();
+    this.#grabBuffer.destroy();
+    this.#bindings.clear();
   }
 
-  #encodeStep(encoder: GPUCommandEncoder) {
-    const grid = [Math.ceil((this.#params.N ** 3) / WORKGROUP)];
+  #encodeStep(encoder: GPUComputePassEncoder) {
+    const grid = [Math.ceil(this.#params.N ** 3 / WORKGROUP)];
     const bd = [Math.ceil(this.mesh.nb / WORKGROUP)];
-    this.#dispatch(encoder, "predict", [this.#paramBuffer, this.#buffers.u, this.#buffers.X, this.#buffers.XMid], bd);
+    this.#dispatch(
+      encoder,
+      "predict",
+      [this.#paramBuffer, this.#buffers.u, this.#buffers.X, this.#buffers.XMid],
+      bd,
+    );
     this.#dispatch(
       encoder,
       "force",
-      [this.#paramBuffer, this.#buffers.XMid, this.#buffers.starts, this.#buffers.neighbors, this.#buffers.F],
+      [
+        this.#paramBuffer,
+        this.#buffers.XMid,
+        this.#buffers.starts,
+        this.#buffers.neighbors,
+        this.#buffers.F,
+        this.#grabBuffer,
+        this.#buffers.restLengths,
+      ],
       bd,
     );
-    this.#dispatch(encoder, "spread", [this.#paramBuffer, this.#buffers.XMid, this.#buffers.F, this.#buffers.ff], grid);
-    this.#dispatch(encoder, "rhsHalf", [this.#paramBuffer, this.#buffers.u, this.#buffers.u, this.#buffers.ff, this.#buffers.w], grid);
+    this.#dispatch(
+      encoder,
+      "spread",
+      [
+        this.#paramBuffer,
+        this.#buffers.XMid,
+        this.#buffers.F,
+        this.#buffers.ff,
+      ],
+      grid,
+    );
+    this.#dispatch(
+      encoder,
+      "rhsHalf",
+      [
+        this.#paramBuffer,
+        this.#buffers.u,
+        this.#buffers.u,
+        this.#buffers.ff,
+        this.#buffers.w,
+      ],
+      grid,
+    );
     this.#encodeFluidSolve(encoder, this.#buffers.w, this.#buffers.uHalf);
-    this.#dispatch(encoder, "rhsFull", [this.#paramBuffer, this.#buffers.u, this.#buffers.uHalf, this.#buffers.ff, this.#buffers.w], grid);
+    this.#dispatch(
+      encoder,
+      "rhsFull",
+      [
+        this.#paramBuffer,
+        this.#buffers.u,
+        this.#buffers.uHalf,
+        this.#buffers.ff,
+        this.#buffers.w,
+      ],
+      grid,
+    );
     this.#encodeFluidSolve(encoder, this.#buffers.w, this.#buffers.uNext);
     this.#dispatch(
       encoder,
       "updateX",
-      [this.#paramBuffer, this.#buffers.uHalf, this.#buffers.X, this.#buffers.XMid, this.#buffers.XNext],
+      [
+        this.#paramBuffer,
+        this.#buffers.uHalf,
+        this.#buffers.X,
+        this.#buffers.XMid,
+        this.#buffers.XNext,
+      ],
       bd,
     );
   }
 
-  #encodeFluidSolve(encoder: GPUCommandEncoder, input: GPUBuffer, output: GPUBuffer) {
+  #encodeFluidSolve(
+    encoder: GPUComputePassEncoder,
+    input: GPUBuffer,
+    output: GPUBuffer,
+  ) {
     const axisLines = [this.#params.N * this.#params.N];
-    this.#dispatch(encoder, "fftXReal", [this.#paramBuffer, input, this.#buffers.zrA, this.#buffers.ziA], axisLines);
-    this.#dispatch(encoder, "fftY", [this.#paramBuffer, this.#buffers.zrA, this.#buffers.ziA, this.#buffers.zrB, this.#buffers.ziB], axisLines);
-    this.#dispatch(encoder, "fftZ", [this.#paramBuffer, this.#buffers.zrB, this.#buffers.ziB, this.#buffers.zrA, this.#buffers.ziA], axisLines);
-    this.#dispatch(encoder, "project", [this.#paramBuffer, this.#buffers.zrA, this.#buffers.ziA, this.#buffers.zrB, this.#buffers.ziB], axisLines);
-    this.#dispatch(encoder, "idftZ", [this.#paramBuffer, this.#buffers.zrB, this.#buffers.ziB, this.#buffers.zrA, this.#buffers.ziA], axisLines);
-    this.#dispatch(encoder, "idftY", [this.#paramBuffer, this.#buffers.zrA, this.#buffers.ziA, this.#buffers.zrB, this.#buffers.ziB], axisLines);
-    this.#dispatch(encoder, "idftXReal", [this.#paramBuffer, this.#buffers.zrB, this.#buffers.ziB, output], axisLines);
+    this.#dispatch(
+      encoder,
+      "fftXReal",
+      [this.#paramBuffer, input, this.#buffers.zrA, this.#buffers.ziA],
+      axisLines,
+    );
+    this.#dispatch(
+      encoder,
+      "fftY",
+      [
+        this.#paramBuffer,
+        this.#buffers.zrA,
+        this.#buffers.ziA,
+        this.#buffers.zrB,
+        this.#buffers.ziB,
+      ],
+      axisLines,
+    );
+    this.#dispatch(
+      encoder,
+      "fftZ",
+      [
+        this.#paramBuffer,
+        this.#buffers.zrB,
+        this.#buffers.ziB,
+        this.#buffers.zrA,
+        this.#buffers.ziA,
+      ],
+      axisLines,
+    );
+    this.#dispatch(
+      encoder,
+      "project",
+      [
+        this.#paramBuffer,
+        this.#buffers.zrA,
+        this.#buffers.ziA,
+        this.#buffers.zrB,
+        this.#buffers.ziB,
+      ],
+      [Math.ceil(this.#params.N ** 3 / WORKGROUP)],
+    );
+    this.#dispatch(
+      encoder,
+      "idftZ",
+      [
+        this.#paramBuffer,
+        this.#buffers.zrB,
+        this.#buffers.ziB,
+        this.#buffers.zrA,
+        this.#buffers.ziA,
+      ],
+      axisLines,
+    );
+    this.#dispatch(
+      encoder,
+      "idftY",
+      [
+        this.#paramBuffer,
+        this.#buffers.zrA,
+        this.#buffers.ziA,
+        this.#buffers.zrB,
+        this.#buffers.ziB,
+      ],
+      axisLines,
+    );
+    this.#dispatch(
+      encoder,
+      "idftXReal",
+      [this.#paramBuffer, this.#buffers.zrB, this.#buffers.ziB, output],
+      axisLines,
+    );
   }
 
-  #dispatch(encoder: GPUCommandEncoder, key: PipelineKey, buffers: GPUBuffer[], workgroups: number[]) {
+  #dispatch(
+    encoder: GPUCommandEncoder | GPUComputePassEncoder,
+    key: PipelineKey,
+    buffers: GPUBuffer[],
+    workgroups: number[],
+  ) {
     const pipeline = this.#pipelines.get(key);
     if (!pipeline) throw new Error(`Missing IB3D pipeline ${key}`);
-    const entries = buffers.map((buffer, binding) => ({ binding, resource: { buffer } }));
-    const pass = encoder.beginComputePass();
+    const cached = this.#bindings.get(key) ?? [];
+    let binding = cached.find((entry) =>
+      entry.buffers.every((buffer, i) => buffer === buffers[i]),
+    );
+    if (!binding) {
+      binding = {
+        buffers,
+        group: this.device.createBindGroup({
+          layout: pipeline.getBindGroupLayout(0),
+          entries: buffers.map((buffer, binding) => ({
+            binding,
+            resource: { buffer },
+          })),
+        }),
+      };
+      cached.push(binding);
+      this.#bindings.set(key, cached);
+    }
+    const standalone = "beginComputePass" in encoder;
+    const pass = standalone ? encoder.beginComputePass() : encoder;
     pass.setPipeline(pipeline);
-    pass.setBindGroup(0, this.device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries }));
-    pass.dispatchWorkgroups(workgroups[0], workgroups[1] ?? 1, workgroups[2] ?? 1);
-    pass.end();
+    pass.setBindGroup(0, binding.group);
+    pass.dispatchWorkgroups(
+      workgroups[0],
+      workgroups[1] ?? 1,
+      workgroups[2] ?? 1,
+    );
+    if (standalone) pass.end();
   }
 
   #writeParams() {
@@ -280,7 +530,6 @@ export class WebGpuIb3DSolver {
     view.setFloat32(20, p.dt, true);
     view.setFloat32(24, p.K, true);
     view.setFloat32(28, p.mu, true);
-    view.setFloat32(32, p.damping, true);
     view.setFloat32(36, p.radius, true);
     this.device.queue.writeBuffer(this.#paramBuffer, 0, data);
   }
@@ -290,38 +539,86 @@ export class WebGpuIb3DSolver {
   }
 }
 
-function createBuffers(device: GPUDevice, params: IB3DParams, mesh: Mesh): Buffers {
+function validateParams(p: IB3DParams) {
+  if (!Number.isInteger(p.N) || p.N < 4 || p.N > 128 || (p.N & (p.N - 1)) !== 0)
+    throw new Error("Grid must be a power of two from 4 to 128");
+  if (
+    ![p.dt, p.K, p.mu, p.radius].every(Number.isFinite) ||
+    p.dt <= 0 ||
+    p.K < 0 ||
+    p.mu < 0 ||
+    p.radius <= 0 ||
+    p.radius >= 0.5
+  )
+    throw new Error("Invalid 3D physical parameters");
+  if (!Number.isInteger(p.refinement) || p.refinement < 0 || p.refinement > 4)
+    throw new Error("Invalid mesh refinement");
+}
+
+function createBuffers(
+  device: GPUDevice,
+  params: IB3DParams,
+  mesh: Mesh,
+): Buffers {
   const n3 = params.N ** 3;
   const gridBytes = n3 * 16;
   const bdBytes = mesh.nb * 16;
   return {
-    u: dataBuffer(device, initialVelocity(params), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST),
+    u: dataBuffer(
+      device,
+      initialVelocity(params),
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    ),
     uHalf: emptyBuffer(device, gridBytes, GPUBufferUsage.STORAGE),
-    uNext: emptyBuffer(device, gridBytes, GPUBufferUsage.STORAGE),
+    uNext: emptyBuffer(
+      device,
+      gridBytes,
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    ),
     w: emptyBuffer(device, gridBytes, GPUBufferUsage.STORAGE),
     zrA: emptyBuffer(device, gridBytes, GPUBufferUsage.STORAGE),
     ziA: emptyBuffer(device, gridBytes, GPUBufferUsage.STORAGE),
     zrB: emptyBuffer(device, gridBytes, GPUBufferUsage.STORAGE),
     ziB: emptyBuffer(device, gridBytes, GPUBufferUsage.STORAGE),
-    X: dataBuffer(device, mesh.positions, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST),
+    X: dataBuffer(
+      device,
+      mesh.positions,
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    ),
     XMid: emptyBuffer(device, bdBytes, GPUBufferUsage.STORAGE),
-    XNext: emptyBuffer(device, bdBytes, GPUBufferUsage.STORAGE),
+    XNext: emptyBuffer(
+      device,
+      bdBytes,
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    ),
     F: emptyBuffer(device, bdBytes, GPUBufferUsage.STORAGE),
     ff: emptyBuffer(device, gridBytes, GPUBufferUsage.STORAGE),
     triangles: dataBuffer(device, mesh.triangles, GPUBufferUsage.STORAGE),
     edges: dataBuffer(device, mesh.edges, GPUBufferUsage.STORAGE),
     starts: dataBuffer(device, mesh.starts, GPUBufferUsage.STORAGE),
     neighbors: dataBuffer(device, mesh.neighbors, GPUBufferUsage.STORAGE),
-    field: emptyBuffer(device, n3 * 4, GPUBufferUsage.STORAGE),
+    restLengths: dataBuffer(device, mesh.restLengths, GPUBufferUsage.STORAGE),
+    field: emptyBuffer(device, n3 * 16, GPUBufferUsage.STORAGE),
   };
 }
 
-function emptyBuffer(device: GPUDevice, size: number, usage: GPUBufferUsageFlags) {
-  return device.createBuffer({ size, usage });
+function emptyBuffer(
+  device: GPUDevice,
+  size: number,
+  usage: GPUBufferUsageFlags,
+) {
+  return device.createBuffer({ size, usage: usage | GPUBufferUsage.COPY_SRC });
 }
 
-function dataBuffer(device: GPUDevice, data: Float32Array | Uint32Array, usage: GPUBufferUsageFlags) {
-  const buffer = device.createBuffer({ size: align4(data.byteLength), usage: usage | GPUBufferUsage.COPY_DST });
+function dataBuffer(
+  device: GPUDevice,
+  data: Float32Array | Uint32Array,
+  usage: GPUBufferUsageFlags,
+) {
+  const buffer = device.createBuffer({
+    size: align4(data.byteLength),
+    usage: usage | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+  });
   device.queue.writeBuffer(buffer, 0, gpuData(data));
   return buffer;
 }
@@ -336,14 +633,14 @@ function align4(n: number) {
 
 function initialVelocity({ N }: IB3DParams) {
   const u = new Float32Array(N ** 3 * 4);
-  const amp = 0.035;
+  const amp = 0.2;
   for (let i = 0; i < N; i++) {
     for (let j = 0; j < N; j++) {
       for (let k = 0; k < N; k++) {
         const p = ((i * N + j) * N + k) * 4;
-        u[p] = amp * Math.sin(2 * Math.PI * k / N);
+        u[p] = amp * Math.sin((2 * Math.PI * k) / N);
         u[p + 1] = 0;
-        u[p + 2] = amp * Math.sin(2 * Math.PI * j / N);
+        u[p + 2] = amp * Math.sin((2 * Math.PI * j) / N);
       }
     }
   }
@@ -351,21 +648,38 @@ function initialVelocity({ N }: IB3DParams) {
 }
 
 function createSphereMesh(refinement: number, radius: number): Mesh {
-  const theta = 2 * Math.PI / 5;
+  const theta = (2 * Math.PI) / 5;
   const z = Math.cos(theta) / (1 - Math.cos(theta));
   const r = Math.sqrt(1 - z * z);
   let vertices: number[][] = [[0, 0, 1]];
-  for (let j = 1; j <= 5; j++) vertices.push([r * Math.cos(j * theta), r * Math.sin(j * theta), z]);
+  for (let j = 1; j <= 5; j++)
+    vertices.push([r * Math.cos(j * theta), r * Math.sin(j * theta), z]);
   for (let j = 1; j <= 5; j++) {
     const k = j - 0.5;
     vertices.push([r * Math.cos(k * theta), r * Math.sin(k * theta), -z]);
   }
   vertices.push([0, 0, -1]);
   let tris = [
-    [0, 1, 2], [0, 2, 3], [0, 3, 4], [0, 4, 5], [0, 5, 1],
-    [1, 7, 2], [2, 8, 3], [3, 9, 4], [4, 10, 5], [5, 6, 1],
-    [7, 1, 6], [8, 2, 7], [9, 3, 8], [10, 4, 9], [6, 5, 10],
-    [6, 11, 7], [7, 11, 8], [8, 11, 9], [9, 11, 10], [10, 11, 6],
+    [0, 1, 2],
+    [0, 2, 3],
+    [0, 3, 4],
+    [0, 4, 5],
+    [0, 5, 1],
+    [1, 7, 2],
+    [2, 8, 3],
+    [3, 9, 4],
+    [4, 10, 5],
+    [5, 6, 1],
+    [7, 1, 6],
+    [8, 2, 7],
+    [9, 3, 8],
+    [10, 4, 9],
+    [6, 5, 10],
+    [6, 11, 7],
+    [7, 11, 8],
+    [8, 11, 9],
+    [9, 11, 10],
+    [10, 11, 6],
   ];
   for (let n = 0; n < refinement; n++) {
     const midpoint = new Map<string, number>();
@@ -384,16 +698,23 @@ function createSphereMesh(refinement: number, radius: number): Mesh {
       return vertices.length - 1;
     };
     for (const [a, b, c] of tris) {
-      const ab = mid(a, b), bc = mid(b, c), ca = mid(c, a);
+      const ab = mid(a, b),
+        bc = mid(b, c),
+        ca = mid(c, a);
       next.push([a, ab, ca], [b, bc, ab], [c, ca, bc], [ab, bc, ca]);
     }
     tris = next;
   }
   const edgeMap = new Map<string, [number, number]>();
-  for (const [a, b, c] of tris) for (const [u, v] of [[a, b], [b, c], [c, a]]) {
-    const key = u < v ? `${u}:${v}` : `${v}:${u}`;
-    if (!edgeMap.has(key)) edgeMap.set(key, u < v ? [u, v] : [v, u]);
-  }
+  for (const [a, b, c] of tris)
+    for (const [u, v] of [
+      [a, b],
+      [b, c],
+      [c, a],
+    ]) {
+      const key = u < v ? `${u}:${v}` : `${v}:${u}`;
+      if (!edgeMap.has(key)) edgeMap.set(key, u < v ? [u, v] : [v, u]);
+    }
   const edges = [...edgeMap.values()];
   const adj = Array.from({ length: vertices.length }, () => [] as number[]);
   for (const [a, b] of edges) {
@@ -416,12 +737,25 @@ function createSphereMesh(refinement: number, radius: number): Mesh {
     positions[i * 4 + 2] = 0.5 + radius * p[2];
     positions[i * 4 + 3] = 1;
   });
+  // Each material edge is relaxed in the initial geometry; never reset these
+  // lengths during deformation or wrap material edges across the periodic box.
+  const restLengths = new Float32Array(neighbors.length);
+  adj.forEach((items, i) => {
+    items.forEach((j, a) => {
+      restLengths[starts[i * 2] + a] = Math.hypot(
+        positions[j * 4] - positions[i * 4],
+        positions[j * 4 + 1] - positions[i * 4 + 1],
+        positions[j * 4 + 2] - positions[i * 4 + 2],
+      );
+    });
+  });
   return {
     positions,
     triangles: new Uint32Array(tris.flat()),
     edges: new Uint32Array(edges.flat()),
     starts,
     neighbors,
+    restLengths,
     nb: vertices.length,
     nt: tris.length,
     ne: edges.length,
@@ -452,12 +786,18 @@ async function createPipelines(device: GPUDevice, params: IB3DParams) {
     impulse: impulseShader(params),
     field: fieldShader(params),
   };
-  for (const [key, code] of Object.entries(shaders) as [PipelineKey, string][]) {
+  for (const [key, code] of Object.entries(shaders) as [
+    PipelineKey,
+    string,
+  ][]) {
     pipelines.set(
       key,
       await device.createComputePipelineAsync({
         layout: "auto",
-        compute: { module: device.createShaderModule({ code }), entryPoint: "main" },
+        compute: {
+          module: device.createShaderModule({ code }),
+          entryPoint: "main",
+        },
       }),
     );
   }
@@ -475,7 +815,7 @@ const TWO_PI: f32 = 6.283185307179586;
 struct Params {
   n: u32, nb: u32, ne: u32, nt: u32,
   h: f32, dt: f32, k: f32, mu: f32,
-  damping: f32, radius: f32, pad0: f32, pad1: f32,
+  reserved: f32, radius: f32, pad0: f32, pad1: f32,
 }
 
 fn wrapi(i: i32) -> u32 {
@@ -514,7 +854,7 @@ fn pick(v: vec3f, c: u32) -> f32 {
   return v.z;
 }
 fn interp(u: ptr<storage, array<vec4f>, read>, p0: vec3f) -> vec3f {
-  let s = p0 * f32(N);
+  let s = wrap01(p0) * f32(N);
   let base = vec3i(floor(s));
   var out = vec3f(0.0);
   for (var di = -1; di <= 2; di++) {
@@ -551,7 +891,7 @@ fn skewComponent(i: u32, j: u32, k: u32, c: u32, u: ptr<storage, array<vec4f>, r
     (vip.x + uc.x) * pick(vip, c) - (vim.x + uc.x) * pick(vim, c) +
     (vjp.y + uc.y) * pick(vjp, c) - (vjm.y + uc.y) * pick(vjm, c) +
     (vkp.z + uc.z) * pick(vkp, c) - (vkm.z + uc.z) * pick(vkm, c)
-  ) / (6.0 * p_h());
+  ) / (4.0 * p_h()); // Half of (advective + conservative), in any dimension.
 }
 
 fn skewVec(i: u32, j: u32, k: u32, u: ptr<storage, array<vec4f>, read>) -> vec3f {
@@ -588,7 +928,9 @@ fn p_h() -> f32 { return params0.h; }
 }
 
 function predictShader(params: IB3DParams) {
-  return common(params) + /* wgsl */ `
+  return (
+    common(params) +
+    /* wgsl */ `
 @group(0) @binding(0) var<storage, read> params0: Params;
 @group(0) @binding(1) var<storage, read> u: array<vec4f>;
 @group(0) @binding(2) var<storage, read> x: array<vec4f>;
@@ -598,17 +940,22 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   let id = gid.x;
   if (id >= params0.nb) { return; }
   let v = interp(&u, x[id].xyz);
-  xMid[id] = vec4f(wrap01(x[id].xyz + 0.5 * params0.dt * v), 1.0);
-}`;
+  xMid[id] = vec4f(x[id].xyz + 0.5 * params0.dt * v, 1.0);
+}`
+  );
 }
 
 function forceShader(params: IB3DParams) {
-  return common(params) + /* wgsl */ `
+  return (
+    common(params) +
+    /* wgsl */ `
 @group(0) @binding(0) var<storage, read> params0: Params;
 @group(0) @binding(1) var<storage, read> x: array<vec4f>;
 @group(0) @binding(2) var<storage, read> starts: array<vec2u>;
 @group(0) @binding(3) var<storage, read> neighbors: array<u32>;
 @group(0) @binding(4) var<storage, read_write> f: array<vec4f>;
+@group(0) @binding(5) var<storage, read> grab: array<vec4f>;
+@group(0) @binding(6) var<storage, read> restLengths: array<f32>;
 @compute @workgroup_size(${WORKGROUP})
 fn main(@builtin(global_invocation_id) gid: vec3u) {
   let id = gid.x;
@@ -618,14 +965,26 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   var force = vec3f(0.0);
   for (var a = 0u; a < sc.y; a++) {
     let j = neighbors[sc.x + a];
-    force += params0.k * periodicDelta(x[j].xyz, xi);
+    let edge = x[j].xyz - xi;
+    let len = length(edge);
+    // A collapsed edge has no defined direction; avoid a division by zero.
+    if (len > 1e-8) {
+      force += params0.k * (len - restLengths[sc.x + a]) * (edge / len);
+    }
+  }
+  if (grab[0].w > 0.0 && i32(id) == i32(grab[1].x)) {
+    let pull = grab[0].w * (grab[0].xyz - xi);
+    force += pull * min(1.0, 0.01 / max(length(pull), 1e-8));
   }
   f[id] = vec4f(force, 0.0);
-}`;
+}`
+  );
 }
 
 function spreadShader(params: IB3DParams) {
-  return common(params) + /* wgsl */ `
+  return (
+    common(params) +
+    /* wgsl */ `
 @group(0) @binding(0) var<storage, read> params0: Params;
 @group(0) @binding(1) var<storage, read> x: array<vec4f>;
 @group(0) @binding(2) var<storage, read> f: array<vec4f>;
@@ -640,20 +999,27 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   let k = id % N;
   var out = vec3f(0.0);
   for (var q = 0u; q < params0.nb; q++) {
-    let s = x[q].xyz * f32(N);
+    let s = wrap01(x[q].xyz) * f32(N);
     let wx = phi(gridDelta(i, s.x));
+    if (wx == 0.0) { continue; }
     let wy = phi(gridDelta(j, s.y));
+    if (wy == 0.0) { continue; }
     let wz = phi(gridDelta(k, s.z));
     out += f[q].xyz * (wx * wy * wz);
   }
   ff[id] = vec4f(out / (params0.h * params0.h * params0.h), 0.0);
-}`;
+}`
+  );
 }
 
 function rhsShader(params: IB3DParams, halfStep: boolean) {
   const scale = halfStep ? "0.5" : "1.0";
-  const lap = halfStep ? "" : "w += 0.5 * params0.dt * params0.mu * lapVec(i, j, k, &base);";
-  return common(params) + /* wgsl */ `
+  const lap = halfStep
+    ? ""
+    : "w += 0.5 * params0.dt * params0.mu * lapVec(i, j, k, &base);";
+  return (
+    common(params) +
+    /* wgsl */ `
 @group(0) @binding(0) var<storage, read> params0: Params;
 @group(0) @binding(1) var<storage, read> base: array<vec4f>;
 @group(0) @binding(2) var<storage, read> adv: array<vec4f>;
@@ -670,11 +1036,14 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   var w = base[id].xyz - ${scale} * params0.dt * skewVec(i, j, k, &adv) + ${scale} * params0.dt * ff[id].xyz;
   ${lap}
   outW[id] = vec4f(w, 0.0);
-}`;
+}`
+  );
 }
 
 function fftCommon(params: IB3DParams) {
-  return common(params) + /* wgsl */ `
+  return (
+    common(params) +
+    /* wgsl */ `
 var<workgroup> fftRe: array<vec4f, N>;
 var<workgroup> fftIm: array<vec4f, N>;
 
@@ -706,11 +1075,14 @@ fn fftShared(tid: u32, inverse: bool) {
     workgroupBarrier();
   }
 }
-`;
+`
+  );
 }
 
 function fftXRealShader(params: IB3DParams) {
-  return fftCommon(params) + /* wgsl */ `
+  return (
+    fftCommon(params) +
+    /* wgsl */ `
 @group(0) @binding(0) var<storage, read> params0: Params;
 @group(0) @binding(1) var<storage, read> realIn: array<vec4f>;
 @group(0) @binding(2) var<storage, read_write> zrOut: array<vec4f>;
@@ -728,14 +1100,18 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec
   fftShared(tid, false);
   zrOut[idx3(tid, j, k)] = fftRe[tid];
   ziOut[idx3(tid, j, k)] = fftIm[tid];
-}`;
+}`
+  );
 }
 
 function fftAxisShader(params: IB3DParams, axis: "y" | "z", inverse: boolean) {
-  const load = axis === "y"
-    ? "let i = line / N; let k = line % N; let src = bitReverse(tid); let dst = tid; let readIdx = idx3(i, src, k); let writeIdx = idx3(i, dst, k);"
-    : "let i = line / N; let j = line % N; let src = bitReverse(tid); let dst = tid; let readIdx = idx3(i, j, src); let writeIdx = idx3(i, j, dst);";
-  return fftCommon(params) + /* wgsl */ `
+  const load =
+    axis === "y"
+      ? "let i = line / N; let k = line % N; let src = bitReverse(tid); let dst = tid; let readIdx = idx3(i, src, k); let writeIdx = idx3(i, dst, k);"
+      : "let i = line / N; let j = line % N; let src = bitReverse(tid); let dst = tid; let readIdx = idx3(i, j, src); let writeIdx = idx3(i, j, dst);";
+  return (
+    fftCommon(params) +
+    /* wgsl */ `
 @group(0) @binding(0) var<storage, read> params0: Params;
 @group(0) @binding(1) var<storage, read> zrIn: array<vec4f>;
 @group(0) @binding(2) var<storage, read> ziIn: array<vec4f>;
@@ -752,11 +1128,14 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec
   fftShared(tid, ${inverse ? "true" : "false"});
   zrOut[writeIdx] = fftRe[tid];
   ziOut[writeIdx] = fftIm[tid];
-}`;
+}`
+  );
 }
 
 function projectShader(params: IB3DParams) {
-  return common(params) + /* wgsl */ `
+  return (
+    common(params) +
+    /* wgsl */ `
 @group(0) @binding(0) var<storage, read> params0: Params;
 @group(0) @binding(1) var<storage, read> zrIn: array<vec4f>;
 @group(0) @binding(2) var<storage, read> ziIn: array<vec4f>;
@@ -791,11 +1170,14 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   let factor = 1.0 + 0.5 * params0.dt * params0.mu * 4.0 / (params0.h * params0.h) * dot(d, d);
   zrOut[id] = vec4f(applyOp(zrIn[id].xyz, s, factor, special), 0.0);
   ziOut[id] = vec4f(applyOp(ziIn[id].xyz, s, factor, special), 0.0);
-}`;
+}`
+  );
 }
 
 function idftXRealShader(params: IB3DParams) {
-  return fftCommon(params) + /* wgsl */ `
+  return (
+    fftCommon(params) +
+    /* wgsl */ `
 @group(0) @binding(0) var<storage, read> params0: Params;
 @group(0) @binding(1) var<storage, read> zrIn: array<vec4f>;
 @group(0) @binding(2) var<storage, read> ziIn: array<vec4f>;
@@ -810,13 +1192,16 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec
   fftRe[tid] = zrIn[idx3(src, j, k)];
   fftIm[tid] = ziIn[idx3(src, j, k)];
   fftShared(tid, true);
-  let scale = params0.damping / f32(N * N * N);
+  let scale = 1.0 / f32(params0.n * params0.n * params0.n);
   outU[idx3(tid, j, k)] = vec4f(fftRe[tid].xyz * scale, 0.0);
-}`;
+}`
+  );
 }
 
 function updateShader(params: IB3DParams) {
-  return common(params) + /* wgsl */ `
+  return (
+    common(params) +
+    /* wgsl */ `
 @group(0) @binding(0) var<storage, read> params0: Params;
 @group(0) @binding(1) var<storage, read> uHalf: array<vec4f>;
 @group(0) @binding(2) var<storage, read> x: array<vec4f>;
@@ -827,12 +1212,15 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   let id = gid.x;
   if (id >= params0.nb) { return; }
   let v = interp(&uHalf, xMid[id].xyz);
-  xNext[id] = vec4f(wrap01(x[id].xyz + params0.dt * v), 1.0);
-}`;
+  xNext[id] = vec4f(x[id].xyz + params0.dt * v, 1.0);
+}`
+  );
 }
 
 function impulseShader(params: IB3DParams) {
-  return common(params) + /* wgsl */ `
+  return (
+    common(params) +
+    /* wgsl */ `
 struct Impulse { center: vec4f, force: vec4f }
 @group(0) @binding(0) var<storage, read> params0: Params;
 @group(0) @binding(1) var<storage, read> impulse: Impulse;
@@ -849,15 +1237,18 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   let d = periodicDelta(pos, impulse.center.xyz);
   let g = exp(-dot(d, d) / (2.0 * impulse.center.w * impulse.center.w));
   u[id] = vec4f(u[id].xyz + params0.dt * impulse.force.xyz * g, 0.0);
-}`;
+}`
+  );
 }
 
 function fieldShader(params: IB3DParams) {
-  return common(params) + /* wgsl */ `
+  return (
+    common(params) +
+    /* wgsl */ `
 @group(0) @binding(0) var<storage, read> params0: Params;
 @group(0) @binding(1) var<storage, read> mode: array<u32>;
 @group(0) @binding(2) var<storage, read> u: array<vec4f>;
-@group(0) @binding(3) var<storage, read_write> field: array<f32>;
+@group(0) @binding(3) var<storage, read_write> field: array<vec4f>;
 @compute @workgroup_size(${WORKGROUP})
 fn main(@builtin(global_invocation_id) gid: vec3u) {
   let id = gid.x;
@@ -867,7 +1258,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   let j = (id / N) % N;
   let k = id % N;
   if (mode[0] == 0u) {
-    field[id] = length(u[id].xyz);
+    field[id] = vec4f(u[id].xyz, length(u[id].xyz));
     return;
   }
   let ip = (i + 1u) % N;
@@ -882,6 +1273,8 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   let dvz_dx = (getv(&u, ip, j, k).z - getv(&u, im, j, k).z) / (2.0 * params0.h);
   let dvy_dx = (getv(&u, ip, j, k).y - getv(&u, im, j, k).y) / (2.0 * params0.h);
   let dvx_dy = (getv(&u, i, jp, k).x - getv(&u, i, jm, k).x) / (2.0 * params0.h);
-  field[id] = length(vec3f(dvz_dy - dvy_dz, dvx_dz - dvz_dx, dvy_dx - dvx_dy));
-}`;
+  let curl = vec3f(dvz_dy - dvy_dz, dvx_dz - dvz_dx, dvy_dx - dvx_dy);
+  field[id] = vec4f(curl, length(curl));
+}`
+  );
 }
