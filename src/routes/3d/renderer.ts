@@ -126,14 +126,16 @@ struct Out { @builtin(position) pos:vec4f,@location(0) world:vec3f }
 }
 @fragment fn fs(o:Out) -> @location(0) vec4f { if(outside(o.world)) { discard; } return vec4f(0.12,0.22,0.24,0.42); }
 `;
+// A square 17×17 lattice gives approximately twice the former 12×12 density.
+const ARROW_GRID = 17;
 const arrowShader =
   common +
   sampling +
   /* wgsl */ `
 @vertex fn vs(@builtin(vertex_index) vi:u32,@builtin(instance_index) ii:u32) -> @builtin(position) vec4f {
-  let p=planePoint((f32(ii/12u)+0.5)/12.0,(f32(ii%12u)+0.5)/12.0);
+  let p=planePoint((f32(ii/${ARROW_GRID}u)+0.5)/${ARROW_GRID}.0,(f32(ii%${ARROW_GRID}u)+0.5)/${ARROW_GRID}.0);
   let v=sampleField(p).xyz; let size=length(v); let dir=v/max(size,1e-8);
-  let len=0.068*clamp(size/u.field.z,0.0,1.0);
+  let len=${0.068 * 12 / ARROW_GRID}*clamp(size/u.field.z,0.0,1.0);
   let side=normalize(cross(dir,select(vec3f(0,0,1),vec3f(0,1,0),abs(dir.z)>0.8))+vec3f(1e-8));
   let tip=p+dir*len*0.5; let tail=p-dir*len*0.5;
   var q=tail;
@@ -359,7 +361,7 @@ export class Ib3DRenderer {
       colorAttachments: [
         {
           view: this.#context.getCurrentTexture().createView(),
-          clearValue: { r: 0.965, g: 0.97, b: 0.955, a: 1 },
+          clearValue: { r: 0.97, g: 0.97, b: 0.97, a: 1 },
           loadOp: "clear",
           storeOp: "store",
         },
@@ -413,7 +415,7 @@ export class Ib3DRenderer {
       27,
     );
     if (o.arrows && o.view === "slice")
-      draw("arrows", [solver.fieldBuffer], 6, 144);
+      draw("arrows", [solver.fieldBuffer], 6, ARROW_GRID * ARROW_GRID);
     pass.setVertexBuffer(0, this.#guides);
     draw("guides", [], lines.length / 6);
     pass.end();

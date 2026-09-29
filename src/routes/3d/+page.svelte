@@ -1,7 +1,7 @@
 <script lang="ts">
   import { defaultDevice, getWebGPUDevice, init } from "@jax-js/jax";
   import { onMount } from "svelte";
-  import SimulationNav from "$lib/SimulationNav.svelte";
+  import SimulationHeader from "$lib/SimulationHeader.svelte";
   import { MOUSE, Plane, Vector3 } from "three";
   import {
     WebGpuIb3DSolver,
@@ -43,9 +43,9 @@
   let depth = $state(0.5);
   let fieldScale = $state(0.5);
   let opacity = $state(0.85);
-  let surface = $state(0.18);
+  let surface = $state(0.6);
   let arrows = $state(true);
-  let paramN = $state(32);
+  let paramN = $state(64);
   let paramRefine = $state(2);
   let paramK = $state(0.006);
   let paramMu = $state(0.01);
@@ -447,17 +447,12 @@
 <svelte:head><title>Interactive 3D Immersed Boundary Method</title></svelte:head
 >
 <main>
-  <nav>
-    <a href="https://guanhuasun.github.io/">← guanhuasun.github.io</a><span>PERIODIC DOMAIN · [0, 1]³</span>
-  </nav>
-  <header>
-    <h1><em>Interactive</em> 3D Immersed Boundary Method</h1>
-    <p>
-      An elastic shell in an incompressible fluid. Explore the flow, move a
-      slice, or pull the surface.
-    </p>
-    <SimulationNav current="3d" />
-  </header>
+  <SimulationHeader
+    dimension="3d"
+    description="An elastic shell in an incompressible fluid. Drag to orbit, stir the fluid, or pull the shell."
+    grid={paramN}
+    dt={paramDt}
+  />
   {#if errorMsg}<pre class="error" role="alert">{errorMsg}</pre>{/if}
   <div class="toolbar">
     <div class="modes" aria-label="Interaction mode">
@@ -474,62 +469,139 @@
       {/each}
     </div>
     <div class="actions">
+      <button onclick={() => renderer?.controls.reset()}>Home view</button>
+      <button disabled={busy} onclick={resetSim}>Reset</button>
       <button
+        class="primary"
         disabled={busy}
         onclick={() => {
           endGesture();
           paused = !paused;
         }}>{paused ? "Play" : "Pause"}</button
-      ><button disabled={busy} onclick={resetSim}>Reset</button><button
-        onclick={() => renderer?.controls.reset()}>Home view</button
       >
     </div>
   </div>
-  <section class="stage" aria-label="3D immersed boundary simulation">
-    <canvas
-      bind:this={canvas}
-      tabindex="0"
-      aria-label="Interactive 3D fluid and elastic shell"
-      aria-describedby="interaction-help"
-      onkeydown={onKeyDown}
-      onpointermove={onPointerMove}
-      onpointerup={onPointerUp}
-      onpointercancel={onPointerUp}
-      onlostpointercapture={onPointerUp}
-      onpointerleave={() => {
-        if (pointerId === null) cursor = null;
-      }}
-    ></canvas>
-    <div class="hud">
-      <b>t = {simTime.toFixed(3)}</b><span>{step} steps · {fps} FPS</span><span
-        >{paramN}³ · {meshStats}</span
-      >
-    </div>
-    <div class="legend">
-      <b
-        >{field === "vorticity" ? "Vorticity ω" : "Velocity u"}{component < 3
-          ? ` · ${axes[component]}`
-          : " · magnitude"}</b
-      >
-      <div class:signed={component < 3} class="ramp"></div>
-      <div class="ticks">
-        <span>{component < 3 ? `−${fieldScale}` : "0"}</span
-        >{#if component < 3}<span>0</span>{/if}<span>{fieldScale}</span>
+  <div class="sim-area">
+    <div class="canvas-block">
+      <div class="canvas-caption">
+        {field === "vorticity" ? "Vorticity" : "Velocity"} · {view === "slice"
+          ? "Vector slice"
+          : view === "volume"
+            ? "Volume"
+            : "Shell only"} · {meshStats}
       </div>
-      <small
-        >{arrows && view === "slice"
-          ? "Arrows show the full 3D vector"
-          : "Colors saturate at the displayed range"}</small
-      >
+      <section class="stage" aria-label="3D immersed boundary simulation">
+        <canvas
+          bind:this={canvas}
+          tabindex="0"
+          aria-label="Interactive 3D fluid and elastic shell"
+          aria-describedby="interaction-help"
+          onkeydown={onKeyDown}
+          onpointermove={onPointerMove}
+          onpointerup={onPointerUp}
+          onpointercancel={onPointerUp}
+          onlostpointercapture={onPointerUp}
+          onpointerleave={() => {
+            if (pointerId === null) cursor = null;
+          }}
+        ></canvas>
+        <div class="hud">
+          <b>t = {simTime.toFixed(3)}</b><span>{step} steps · {fps} FPS</span
+          ><span>{paramN}³ · {meshStats}</span>
+        </div>
+        <div class="legend">
+          <b
+            >{field === "vorticity" ? "Vorticity ω" : "Velocity u"}{component <
+            3
+              ? ` · ${axes[component]}`
+              : " · magnitude"}</b
+          >
+          <div class:signed={component < 3} class="ramp"></div>
+          <div class="ticks">
+            <span>{component < 3 ? `−${fieldScale}` : "0"}</span
+            >{#if component < 3}<span>0</span>{/if}<span>{fieldScale}</span>
+          </div>
+          <small
+            >{arrows && view === "slice"
+              ? "Arrows show the full 3D vector"
+              : "Colors saturate at the displayed range"}</small
+          >
+        </div>
+        <div class="axis-key">
+          <span class="x">x</span><span class="y">y</span><span class="z"
+            >z</span
+          >
+        </div>
+        {#if busy}<div class="loading">Preparing grid and shell…</div>{/if}
+        <div class="status" aria-live="polite">
+          {status}{paused ? " · PAUSED" : ""}
+        </div>
+      </section>
     </div>
-    <div class="axis-key">
-      <span class="x">x</span><span class="y">y</span><span class="z">z</span>
-    </div>
-    {#if busy}<div class="loading">Preparing grid and shell…</div>{/if}
-    <div class="status" aria-live="polite">
-      {status}{paused ? " · PAUSED" : ""}
-    </div>
-  </section>
+    <aside class="param-panel" aria-label="Simulation parameters">
+      <fieldset disabled={busy}>
+        <legend>Simulation</legend>
+        <label
+          >Grid<select
+            aria-label="Grid"
+            bind:value={paramN}
+            onchange={() => void rebuild()}
+            ><option value={32}>32³</option><option value={64}>64³</option
+            ></select
+          ></label
+        >
+        <label
+          >Surface mesh<select
+            aria-label="Surface mesh"
+            bind:value={paramRefine}
+            onchange={() => void rebuild()}
+            ><option value={1}>80 triangles</option><option value={2}
+              >320 triangles</option
+            ><option value={3}>1280 triangles</option></select
+          ></label
+        >
+        <label
+          >Stiffness K <output>{paramK.toFixed(3)}</output><input
+            type="range"
+            min="0.001"
+            max="0.04"
+            step="0.001"
+            bind:value={paramK}
+            oninput={syncParams}
+          /></label
+        >
+        <label
+          >Viscosity μ <output>{paramMu.toFixed(3)}</output><input
+            type="range"
+            min="0.002"
+            max="0.04"
+            step="0.001"
+            bind:value={paramMu}
+            oninput={syncParams}
+          /></label
+        >
+        <label
+          >Time step Δt <output>{paramDt.toFixed(4)}</output><input
+            type="range"
+            min="0.0005"
+            max="0.004"
+            step="0.0005"
+            bind:value={paramDt}
+            oninput={syncParams}
+          /></label
+        >
+        <label
+          >Steps per frame <output>{stepsPerFrame}</output><input
+            type="range"
+            min="1"
+            max="6"
+            step="1"
+            bind:value={stepsPerFrame}
+          /></label
+        >
+      </fieldset>
+    </aside>
+  </div>
   <div class="panels">
     <fieldset>
       <legend>Flow display</legend>
@@ -631,67 +703,6 @@
         with one finger and zooms with a pinch; use the buttons to stir or pull.
       </p>
     </fieldset>
-    <fieldset disabled={busy}>
-      <legend>Simulation</legend>
-      <label
-        >Grid<select
-          aria-label="Grid"
-          bind:value={paramN}
-          onchange={() => void rebuild()}
-          ><option value={32}>32³</option><option value={64}>64³</option
-          ></select
-        ></label
-      >
-      <label
-        >Surface mesh<select
-          aria-label="Surface mesh"
-          bind:value={paramRefine}
-          onchange={() => void rebuild()}
-          ><option value={1}>80 triangles</option><option value={2}
-            >320 triangles</option
-          ><option value={3}>1280 triangles</option></select
-        ></label
-      >
-      <label
-        >Stiffness K <output>{paramK.toFixed(3)}</output><input
-          type="range"
-          min="0.001"
-          max="0.04"
-          step="0.001"
-          bind:value={paramK}
-          oninput={syncParams}
-        /></label
-      >
-      <label
-        >Viscosity μ <output>{paramMu.toFixed(3)}</output><input
-          type="range"
-          min="0.002"
-          max="0.04"
-          step="0.001"
-          bind:value={paramMu}
-          oninput={syncParams}
-        /></label
-      >
-      <label
-        >Time step Δt <output>{paramDt.toFixed(4)}</output><input
-          type="range"
-          min="0.0005"
-          max="0.004"
-          step="0.0005"
-          bind:value={paramDt}
-          oninput={syncParams}
-        /></label
-      >
-      <label
-        >Steps per frame <output>{stepsPerFrame}</output><input
-          type="range"
-          min="1"
-          max="6"
-          step="1"
-          bind:value={stepsPerFrame}
-        /></label
-      >
-    </fieldset>
   </div>
   <p class="footnote">
     The slice colors show a signed component or magnitude; arrows retain
@@ -700,35 +711,15 @@
   </p>
 </main>
 
+<footer class="copyright">© 2026 Guanhua Sun</footer>
+
 <style>
   main {
-    max-width: 1200px;
+    max-width: 960px;
     margin: auto;
-    padding: 24px;
+    padding: 28px 24px 48px;
     color: var(--color-text);
     font-family: var(--font-sans);
-  }
-  nav {
-    display: flex;
-    justify-content: space-between;
-    font: 11px var(--font-mono);
-    color: var(--color-text-meta);
-    margin-bottom: 22px;
-  }
-  a {
-    color: inherit;
-  }
-  h1 {
-    font: 28px var(--font-serif);
-    margin: 0 0 8px;
-  }
-  h1 em {
-    color: var(--color-link);
-  }
-  header p {
-    margin: 0;
-    color: var(--color-text-meta);
-    font-size: 14px;
   }
   .toolbar,
   .modes,
@@ -739,13 +730,14 @@
   }
   .toolbar {
     justify-content: space-between;
-    margin: 22px 0 10px;
+    margin: 0 0 16px;
+    min-height: 44px;
     flex-wrap: wrap;
   }
   button,
   select,
   input {
-    font: 12px var(--font-mono);
+    font: 13px var(--font-sans);
   }
   button,
   select,
@@ -753,11 +745,26 @@
     border: 1px solid var(--color-border);
     background: var(--color-bg);
     color: var(--color-text);
-    padding: 9px 12px;
-    border-radius: 3px;
+    padding: 8px 12px;
+    border-radius: 0;
   }
   button {
     cursor: pointer;
+    min-height: 36px;
+    border-color: var(--color-border-strong);
+    font-weight: 500;
+  }
+  button:hover {
+    background: var(--color-surface);
+  }
+  button.primary {
+    background: var(--color-link);
+    color: white;
+    border-color: var(--color-link);
+    min-width: 70px;
+  }
+  button.primary:hover {
+    background: var(--color-link-hover);
   }
   button.active {
     background: var(--color-text);
@@ -769,10 +776,11 @@
   }
   .stage {
     position: relative;
-    height: min(66vh, 650px);
-    min-height: 400px;
+    aspect-ratio: 1;
+    padding: 12px;
+    box-sizing: border-box;
     border: 1px solid var(--color-border);
-    background: #f6f7f3;
+    background: var(--color-surface);
   }
   canvas {
     width: 100%;
@@ -780,6 +788,7 @@
     display: block;
     touch-action: none;
     cursor: grab;
+    border: 1px solid var(--color-border);
   }
   canvas:focus-visible {
     outline: 2px solid var(--color-link);
@@ -792,21 +801,21 @@
     position: absolute;
     pointer-events: none;
     font: 11px var(--font-mono);
-    background: rgb(250 251 248 / 90%);
+    background: rgb(255 255 255 / 90%);
     padding: 9px 12px;
-    color: #44504e;
+    color: var(--color-text-meta);
   }
   .hud {
-    left: 12px;
-    top: 12px;
+    left: 20px;
+    top: 20px;
     display: flex;
     gap: 14px;
     flex-wrap: wrap;
     max-width: calc(100% - 48px);
   }
   .legend {
-    left: 12px;
-    bottom: 50px;
+    left: 20px;
+    bottom: 62px;
     width: 190px;
   }
   .legend b {
@@ -829,15 +838,15 @@
     font: 10px var(--font-mono);
   }
   .status {
-    bottom: 0;
-    left: 0;
-    right: 0;
-    border-top: 1px solid #d9e0d9;
+    bottom: 13px;
+    left: 13px;
+    right: 13px;
+    border-top: 1px solid var(--color-border);
     padding: 10px 14px;
   }
   .axis-key {
-    right: 12px;
-    bottom: 48px;
+    right: 20px;
+    bottom: 60px;
     display: flex;
     gap: 12px;
   }
@@ -855,32 +864,33 @@
     inset: 0;
     display: grid;
     place-items: center;
-    background: #f6f7f3c9;
+    background: rgb(244 244 244 / 80%);
   }
   .panels {
     display: grid;
-    grid-template-columns: 1.1fr 1fr 1fr;
+    grid-template-columns: 1fr 1fr;
     gap: 16px;
     margin-top: 20px;
   }
   fieldset {
     min-width: 0;
-    border: 1px solid var(--color-border);
-    padding: 16px;
+    border: 0;
+    border-top: 1px solid var(--color-border);
+    padding: 16px 0 0;
     display: flex;
     flex-direction: column;
     gap: 12px;
   }
   legend {
-    font: 12px var(--font-mono);
-    padding: 0 7px;
+    font: 600 13px var(--font-sans);
+    padding: 0 8px 0 0;
   }
   label {
     display: grid;
     grid-template-columns: 1fr auto;
     gap: 6px;
-    font: 12px var(--font-mono);
-    color: var(--color-text-meta);
+    font: 500 13px var(--font-sans);
+    color: var(--color-text);
   }
   label select,
   label input[type="range"],
@@ -894,6 +904,7 @@
     align-items: center;
   }
   output {
+    font: 12px var(--font-mono);
     color: var(--color-text);
   }
   fieldset p,
@@ -913,21 +924,71 @@
     padding: 16px;
     color: #8b2e17;
   }
+  .sim-area {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 220px;
+    gap: 24px;
+    align-items: start;
+  }
+  .canvas-block {
+    min-width: 0;
+  }
+  .canvas-caption {
+    font: 11px/1.6 var(--font-mono);
+    color: var(--color-text-meta);
+    margin-bottom: 6px;
+  }
+  .param-panel fieldset {
+    gap: 20px;
+  }
+  .copyright {
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 0 24px 20px;
+    text-align: right;
+    font: 11px var(--font-mono);
+    color: var(--color-text-caption);
+  }
+  input[type="range"] {
+    appearance: none;
+    height: 2px;
+    background: var(--color-border);
+    padding: 0;
+    margin: 10px 0;
+    cursor: pointer;
+  }
+  input[type="range"]::-webkit-slider-thumb {
+    appearance: none;
+    width: 14px;
+    height: 14px;
+    background: var(--color-border-strong);
+    border: 0;
+    border-radius: 2px;
+  }
+  input[type="range"]::-moz-range-thumb {
+    width: 14px;
+    height: 14px;
+    background: var(--color-border-strong);
+    border: 0;
+    border-radius: 2px;
+  }
+  input[type="range"]::-webkit-slider-thumb:hover {
+    background: var(--color-link);
+  }
+  input[type="checkbox"] {
+    accent-color: var(--color-border-strong);
+  }
   @media (max-width: 760px) {
     main {
-      padding: 14px;
+      padding: 24px 16px 32px;
     }
+    .sim-area,
     .panels {
       grid-template-columns: 1fr;
     }
-    h1 {
-      font-size: 23px;
-    }
-    nav span {
-      display: none;
-    }
     .stage {
-      min-height: 440px;
+      aspect-ratio: auto;
+      height: 440px;
     }
     .hud {
       gap: 6px;

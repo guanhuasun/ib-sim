@@ -47,7 +47,7 @@ The 3D initial velocity is `u = 0.2 (sin(2πz), 0, sin(2πy))`. The default play
 ## Features
 
 - Real-time 2D simulation at 64x64 or 128x128 grid resolution.
-- Experimental 3D simulation at 32^3 (default) or 64^3 grid resolution.
+- Experimental 3D simulation at 64^3 (default) or 32^3 grid resolution.
 - FFT-based incompressible fluid solves on the GPU.
 - Interactive mouse/stir forcing.
 - Vorticity and velocity-magnitude visualization modes.

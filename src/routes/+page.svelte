@@ -6,7 +6,7 @@
     numpy as np,
   } from "@jax-js/jax";
   import { onMount } from "svelte";
-  import SimulationNav from "$lib/SimulationNav.svelte";
+  import SimulationHeader from "$lib/SimulationHeader.svelte";
 
   import {
     createParams,
@@ -188,7 +188,13 @@
         if (optimizedSolver) {
           encoder ??= gpuDevice.createCommandEncoder();
           const fieldBuf = optimizedSolver.renderField(vizMode, encoder);
-          renderer.render(fieldBuf, optimizedSolver.boundaryBuffer, params, { vizMode, colormap, invertBg, smooth }, encoder);
+          renderer.render(
+            fieldBuf,
+            optimizedSolver.boundaryBuffer,
+            params,
+            { vizMode, colormap, invertBg, smooth },
+            encoder,
+          );
         } else {
           let viz: np.Array;
           if (vizMode === "vorticity") {
@@ -199,8 +205,16 @@
           // Keep jax-js arrays alive until rendering is submitted.
           const fieldBuf = viz.ref.gpuBufferSync();
           const boundBuf = await sim.X.ref.gpuBuffer();
-          if (!running) { viz.dispose(); break; }
-          renderer.render(fieldBuf, boundBuf, params, { vizMode, colormap, invertBg, smooth });
+          if (!running) {
+            viz.dispose();
+            break;
+          }
+          renderer.render(fieldBuf, boundBuf, params, {
+            vizMode,
+            colormap,
+            invertBg,
+            smooth,
+          });
           viz.dispose();
         }
         if (perfMode) {
@@ -282,7 +296,10 @@
       try {
         await setupOptimizedSolver();
       } catch (e) {
-        console.warn("Optimized solver unavailable after grid change; using reference path.", e);
+        console.warn(
+          "Optimized solver unavailable after grid change; using reference path.",
+          e,
+        );
         setupReferenceSolver();
       }
     } else {
@@ -310,7 +327,10 @@
 
   async function startup() {
     const url = new URL(window.location.href);
-    const preferredSolver = url.searchParams.get("solver") === "reference" ? "reference" : "optimized";
+    const preferredSolver =
+      url.searchParams.get("solver") === "reference"
+        ? "reference"
+        : "optimized";
     perfMode = url.searchParams.get("perf") === "1";
 
     await init("webgpu");
@@ -406,43 +426,63 @@
 </svelte:head>
 
 <main class="ib-sim">
-  <nav class="breadcrumb">
-    <a href="https://guanhuasun.github.io/">&larr; guanhuasun.github.io</a>
-  </nav>
+  <SimulationHeader
+    dimension="2d"
+    description="An elastic membrane in an incompressible fluid. Drag on the fluid to apply force."
+    grid={N}
+    dt={paramDt}
+  />
+  {#if errorMsg}<pre class="error-msg">{errorMsg}</pre>{/if}
 
-  {#if errorMsg}
-    <pre class="error-msg">{errorMsg}</pre>
-  {/if}
+  <section class="toolbar">
+    <div class="toolbar-left">
+      {#if autoPaused}
+        <span class="auto-pause-msg">Paused at t = {simTime.toFixed(2)} s.</span
+        >
+      {/if}
+    </div>
 
-  <header class="page-header">
-    <h1>
-      <span class="title-emphasis">Interactive</span>
-      <a
-        href="https://math.nyu.edu/~peskin/ib_lecture_notes/index.html"
-        class="title-link"
-        target="_blank"
-        rel="noopener noreferrer">2D Immersed Boundary Method</a
-      >
-    </h1>
-    <p class="lede">
-      Elastic membrane coupled to incompressible fluid via regularized delta
-      functions. Click and drag to apply force.
-    </p>
-    <p class="tech-line">
-      WebGPU {solverMode} solver &middot; N={N} &middot; FFT-based IMEX solver
-      &middot; &Delta;t={paramDt.toFixed(4)}
-    </p>
-    <SimulationNav current="2d" />
-  </header>
+    <div class="toolbar-right">
+      <label class="toolbar-field">
+        <span class="toolbar-label">Grid</span>
+        <div class="select-wrap">
+          <select
+            value={paramN}
+            onchange={(e) => void changeN(Number(e.currentTarget.value))}
+          >
+            <option value={64}>64 &times; 64</option>
+            <option value={128}>128 &times; 128</option>
+          </select>
+        </div>
+      </label>
 
-  <hr />
+      <label class="toolbar-field">
+        <span class="toolbar-label">View</span>
+        <div class="select-wrap">
+          <select bind:value={vizMode}>
+            <option value="vorticity">Vorticity</option>
+            <option value="velocity">|Velocity|</option>
+          </select>
+        </div>
+      </label>
+
+      <label class="toolbar-field inline">
+        <input type="checkbox" bind:checked={smooth} />
+        <span class="toolbar-label">Smooth</span>
+      </label>
+
+      <button class="btn" onclick={resetSim}>Reset</button>
+      <button class="btn btn-primary" onclick={togglePause}>
+        {paused ? (autoPaused ? "Continue" : "Play") : "Pause"}
+      </button>
+    </div>
+  </section>
 
   <section class="sim-area">
-    <div class="spacer"></div>
-
     <div class="canvas-block">
       <div class="canvas-caption">
-        {solverMode} &middot; N={N} &middot; &Delta;t={paramDt.toFixed(4)} &middot; {vizLabel} &middot; {cmapLabel}
+        {solverMode} &middot; N={N} &middot; &Delta;t={paramDt.toFixed(4)} &middot;
+        {vizLabel} &middot; {cmapLabel}
       </div>
       <div class="canvas-matte">
         <canvas
@@ -463,10 +503,13 @@
       </div>
     </div>
 
-    <aside class="param-panel">
+    <aside class="param-panel" aria-label="Simulation parameters">
+      <h2>Simulation</h2>
       <div class="param-group">
         <div class="param-label">K &mdash; Stiffness</div>
-        <div class="param-desc">Elastic spring constant of the membrane [N/m]</div>
+        <div class="param-desc">
+          Elastic spring constant of the membrane [N/m]
+        </div>
         <div class="param-row">
           <input
             type="range"
@@ -482,7 +525,9 @@
 
       <div class="param-group">
         <div class="param-label">&mu; &mdash; Viscosity</div>
-        <div class="param-desc">Dynamic viscosity of the fluid [Pa&middot;s]</div>
+        <div class="param-desc">
+          Dynamic viscosity of the fluid [Pa&middot;s]
+        </div>
         <div class="param-row">
           <input
             type="range"
@@ -498,7 +543,9 @@
 
       <div class="param-group">
         <div class="param-label">&Delta;t &mdash; Time step</div>
-        <div class="param-desc">Integration step size [s]. Reduce if unstable.</div>
+        <div class="param-desc">
+          Integration step size [s]. Reduce if unstable.
+        </div>
         <div class="param-row">
           <input
             type="range"
@@ -533,46 +580,6 @@
       </div>
     </aside>
   </section>
-
-  <section class="toolbar">
-    <div class="toolbar-left">
-      {#if autoPaused}
-        <span class="auto-pause-msg">Paused at t = {simTime.toFixed(2)} s.</span>
-      {/if}
-    </div>
-
-    <div class="toolbar-right">
-      <label class="toolbar-field">
-        <span class="toolbar-label">Grid</span>
-        <div class="select-wrap">
-          <select value={paramN} onchange={(e) => void changeN(Number(e.currentTarget.value))}>
-            <option value={64}>64 &times; 64</option>
-            <option value={128}>128 &times; 128</option>
-          </select>
-        </div>
-      </label>
-
-      <label class="toolbar-field">
-        <span class="toolbar-label">View</span>
-        <div class="select-wrap">
-          <select bind:value={vizMode}>
-            <option value="vorticity">Vorticity</option>
-            <option value="velocity">|Velocity|</option>
-          </select>
-        </div>
-      </label>
-
-      <label class="toolbar-field inline">
-        <input type="checkbox" bind:checked={smooth} />
-        <span class="toolbar-label">Smooth</span>
-      </label>
-
-      <button class="btn" onclick={resetSim}>Reset</button>
-      <button class="btn btn-primary" onclick={togglePause}>
-        {paused ? (autoPaused ? "Continue" : "Play") : "Pause"}
-      </button>
-    </div>
-  </section>
 </main>
 
 <footer class="copyright">&copy; 2026 Guanhua Sun</footer>
@@ -583,19 +590,7 @@
     margin: 0 auto;
     padding: 28px 24px 48px;
     color: var(--color-text);
-    font-family: var(--font-serif);
-  }
-
-  .breadcrumb {
-    font-family: var(--font-mono);
-    font-size: 12px;
-    margin-bottom: 20px;
-  }
-  .breadcrumb a {
-    color: var(--color-text-meta);
-  }
-  .breadcrumb a:hover {
-    color: var(--color-text);
+    font-family: var(--font-sans);
   }
 
   .error-msg {
@@ -611,70 +606,21 @@
     word-break: break-word;
   }
 
-  .page-header {
-    margin-bottom: 16px;
-  }
-  .page-header h1 {
-    font-family: var(--font-serif);
-    font-size: 22px;
-    font-weight: 600;
-    line-height: 1.25;
-    letter-spacing: -0.01em;
-    margin: 0 0 6px 0;
-    color: var(--color-text);
-  }
-  .title-link {
-    color: inherit;
-    text-decoration: none;
-    transition: color 0.15s ease;
-  }
-  .title-link:hover {
-    color: var(--color-link);
-    text-decoration: underline;
-    text-underline-offset: 3px;
-  }
-  .title-emphasis {
-    color: var(--color-link);
-    font-style: italic;
-    font-weight: 700;
-  }
-  .lede {
-    font-family: var(--font-sans);
-    font-size: 14px;
-    line-height: 1.55;
-    color: var(--color-text-meta);
-    margin: 0 0 6px 0;
-    max-width: 680px;
-  }
-  .tech-line {
-    font-family: var(--font-mono);
-    font-size: 12px;
-    color: var(--color-text-caption);
-    margin: 0;
-  }
-
-  hr {
-    margin: 16px 0 24px;
-  }
-
-  /* --- Simulation area: spacer + canvas + right panel --- */
+  /* --- Simulation area: canvas + right panel --- */
 
   .sim-area {
-    display: flex;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 220px;
     gap: 24px;
-    align-items: flex-start;
-  }
-  .spacer {
-    flex: 1 1 auto;
-    min-width: 0;
+    align-items: start;
   }
   .canvas-block {
-    flex: 0 0 auto;
+    min-width: 0;
   }
   .canvas-caption {
     font-family: var(--font-mono);
     font-size: 11px;
-    color: var(--color-text-caption);
+    color: var(--color-text-meta);
     margin-bottom: 6px;
     letter-spacing: 0.01em;
   }
@@ -683,12 +629,14 @@
     background: var(--color-surface);
     border: 1px solid var(--color-border);
     padding: 12px;
-    display: inline-block;
+    width: 100%;
+    box-sizing: border-box;
     line-height: 0;
   }
   canvas {
-    width: 512px;
-    height: 512px;
+    width: 100%;
+    height: auto;
+    aspect-ratio: 1;
     cursor: crosshair;
     display: block;
     border: 1px solid var(--color-border);
@@ -721,7 +669,7 @@
     gap: 20px;
     width: 220px;
     flex: 0 0 220px;
-    padding-top: 18px; /* align with canvas matte below caption */
+    padding-top: 0;
   }
   .param-group {
     display: flex;
@@ -736,7 +684,7 @@
     color: var(--color-text);
   }
   .param-desc {
-    font-family: var(--font-serif);
+    font-family: var(--font-sans);
     font-size: 12px;
     color: var(--color-text-meta);
     line-height: 1.4;
@@ -818,7 +766,9 @@
     padding: 0;
     background-clip: padding-box;
     cursor: pointer;
-    transition: border-color 0.15s ease, transform 0.15s ease;
+    transition:
+      border-color 0.15s ease,
+      transform 0.15s ease;
   }
   .swatch:hover {
     border-color: var(--color-border-strong);
@@ -835,15 +785,13 @@
     align-items: center;
     justify-content: space-between;
     gap: 16px;
-    margin-top: 28px;
-    padding-top: 16px;
-    border-top: 1px solid var(--color-border);
+    margin: 0 0 16px;
+    min-height: 44px;
     flex-wrap: wrap;
   }
   .toolbar-left {
     display: flex;
     align-items: center;
-    min-height: 32px;
   }
   .toolbar-right {
     display: flex;
@@ -853,14 +801,14 @@
   }
   .toolbar-field {
     display: flex;
-    flex-direction: column;
-    gap: 4px;
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
   }
   .toolbar-field.inline {
     flex-direction: row;
     align-items: center;
     gap: 6px;
-    padding-top: 18px; /* align with selects */
   }
   .toolbar-label {
     font-family: var(--font-sans);
@@ -871,7 +819,10 @@
     text-transform: uppercase;
   }
   .toolbar-right .btn {
-    align-self: flex-end;
+    min-height: 36px;
+  }
+  .toolbar-right .btn-primary {
+    min-width: 70px;
   }
 
   .select-wrap {
@@ -944,22 +895,32 @@
     color: var(--color-warn);
   }
 
-  .copyright {
-    position: fixed;
-    right: 16px;
-    bottom: 12px;
-    font-family: var(--font-mono);
-    font-size: 11px;
-    color: var(--color-text-caption);
-    pointer-events: none;
+  .param-panel h2 {
+    font: 600 13px var(--font-sans);
+    margin: 0;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--color-border);
   }
-  @media (max-width: 860px) {
-    .sim-area { flex-direction: column; }
-    .spacer { display: none; }
-    .canvas-block { width: 100%; max-width: 538px; }
-    .canvas-matte { width: 100%; box-sizing: border-box; }
-    canvas { width: 100%; height: auto; aspect-ratio: 1; }
-    .param-panel { width: 100%; flex: auto; padding-top: 0; }
-    .copyright { position: static; text-align: right; margin: 16px; }
+  .copyright {
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 0 24px 20px;
+    text-align: right;
+    font: 11px var(--font-mono);
+    color: var(--color-text-caption);
+  }
+  @media (max-width: 760px) {
+    .ib-sim {
+      padding: 24px 16px 32px;
+    }
+    .sim-area {
+      grid-template-columns: 1fr;
+    }
+    .param-panel {
+      width: 100%;
+    }
+    .toolbar-right {
+      gap: 10px;
+    }
   }
 </style>
